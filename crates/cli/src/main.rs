@@ -123,7 +123,18 @@ fn parse_log_cap(spec: Option<&str>) -> u64 {
         .unwrap_or(DEFAULT_LOG_MAX_SIZE)
 }
 
-#[tokio::main]
+// current_thread, not the default multi-threaded flavor: most invocations
+// of this binary are one-shot commands (list/kill/push/current/...) with
+// no real parallelism to exploit, and a multi-threaded runtime's worker-
+// pool spin-up cost showed up directly in a head-to-head benchmark against
+// atch as ~2.5x higher per-invocation overhead (see BENCHMARKS.md). The
+// daemon (__daemon-run) is the one long-lived role, but its actual
+// concurrency need -- a handful of attached clients on one pty -- doesn't
+// require real OS-thread parallelism either; a single-threaded async
+// reactor handles it the same way many single-threaded event-loop daemons
+// do. spawn_blocking (used for log I/O) still gets its own thread pool
+// regardless of this flavor.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

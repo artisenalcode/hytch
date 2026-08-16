@@ -23,6 +23,7 @@ clap = { version = "4", features = ["derive"] }
 rustix = { version = "0.38", features = ["pty", "termios", "process", "fs", "net", "alloc", "stdio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
 
 [profile.release]
 lto = true

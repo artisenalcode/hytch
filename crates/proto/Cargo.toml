@@ -14,3 +14,8 @@ tokio-util.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "codec"
+harness = false
