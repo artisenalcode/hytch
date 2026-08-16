@@ -78,7 +78,7 @@ pub async fn attach_foreground(
         skip_ring: replayed,
     };
 
-    hytch_client::run(
+    let outcome = hytch_client::run(
         tokio::io::stdin(),
         tokio::io::stdout(),
         conn_read,
@@ -86,7 +86,21 @@ pub async fn attach_foreground(
         resize_events,
         opts,
     )
-    .await
+    .await?;
+
+    // Only the real "the hosted program exited" case, deliberately --
+    // Detached/Suspended aren't news (you did that on purpose), and
+    // InputClosed says nothing about whether the session is still alive
+    // remotely (see its doc comment on `AttachOutcome`) -- printing this
+    // there would be actively misleading. Without this message at all,
+    // the exit was completely silent: nothing on screen distinguished "the
+    // session ended" from "this looks frozen," which is exactly what
+    // prompted adding it.
+    if !quiet && outcome == AttachOutcome::SessionEnded {
+        eprintln!("hytch: session ended");
+    }
+
+    Ok(outcome)
 }
 
 /// Refuses to attach if `socket_path` appears anywhere in this process's

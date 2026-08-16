@@ -45,9 +45,25 @@ pub enum AttachOutcome {
     /// told (`Detach`). Caller should suspend the process and, on resume,
     /// re-enter raw mode and call `run` again.
     Suspended,
-    /// The daemon closed the connection (child exited, or the daemon itself
-    /// went away) or stdin hit EOF.
+    /// The daemon closed the connection -- the hosted program actually
+    /// exited (or the daemon itself went away). This is the one outcome a
+    /// caller should treat as "there is nothing left to reattach to": the
+    /// `cli` crate maps this (and only this) to a distinct process exit
+    /// code, so the shell-login auto-attach hook documented in the README
+    /// can propagate it by exiting itself too -- the same as a normal
+    /// (non-hytch) login shell exiting would end the SSH connection.
     SessionEnded,
+    /// Local `input` hit EOF. Deliberately a separate variant from
+    /// `SessionEnded`, not folded into it: this says nothing about whether
+    /// the remote session is still alive -- it's what non-interactive
+    /// piped stdin looks like (a script redirecting `< file` into `hytch`,
+    /// or a test harness), and conflating the two used to mean a caller
+    /// had no way to distinguish "the program you were running actually
+    /// exited" from "your local stdin pipe ran dry while the remote
+    /// session is still there." Found by hand-tracing exactly that
+    /// ambiguity while wiring up a distinct process exit code for the
+    /// former.
+    InputClosed,
 }
 
 /// Drive one attach session: send the initial `Attach`+`Redraw` handshake,
@@ -100,7 +116,7 @@ where
             result = input.read(&mut in_buf) => {
                 let n = result?;
                 if n == 0 {
-                    return Ok(AttachOutcome::SessionEnded);
+                    return Ok(AttachOutcome::InputClosed);
                 }
                 let chunk = &in_buf[..n];
                 if let Some((pos, outcome)) = find_special_char(chunk, opts.detach_char, opts.suspend_char) {

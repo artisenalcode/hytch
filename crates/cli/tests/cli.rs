@@ -232,6 +232,54 @@ fn attach_to_a_nonexistent_session_fails() {
 }
 
 #[test]
+fn attach_exits_with_the_session_ended_code_when_the_child_process_exits() {
+    // Deliberately NOT assert_cmd's `write_stdin` -- that closes stdin
+    // immediately after writing, which races ahead of the daemon closing
+    // its end (see this file's module doc comment) and would hit the
+    // *local* InputClosed outcome instead of the real SessionEnded one
+    // this test targets. Also deliberately NOT `Child::wait()`/
+    // `wait_with_output()` -- both close stdin as their very first action
+    // regardless of whether the caller still holds the `ChildStdin`
+    // handle (documented std behavior, there to avoid the *opposite*
+    // deadlock: a child blocked reading stdin forever while the parent
+    // blocks in wait()). Polling `try_wait()` is the one std API that
+    // doesn't touch stdin, so it's the only way to actually keep the pipe
+    // open for the whole run and prove the daemon closing the connection
+    // -- not local EOF -- is what ends this process.
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join(".cache/hytch/endtest");
+
+    hytch(home.path())
+        .args(["start", "endtest", "--", "sh", "-c", "sleep 0.3; exit 0"])
+        .assert()
+        .success();
+    assert!(wait_until(|| socket.exists(), Duration::from_secs(2)));
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("hytch"))
+        .env("HOME", home.path())
+        .env_remove("HYTCH_SESSION")
+        .args(["attach", "endtest"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!("DEBUG timed out; socket.exists()={}", socket.exists());
+            panic!("attach did not exit within the timeout");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(90));
+}
+
+#[test]
 fn crashed_daemon_log_survives_and_replays_on_next_attach() {
     // Simulate a real crash (SIGKILL on the daemon process itself, not the
     // graceful `Message::Kill` control path that only signals the child)

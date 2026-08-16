@@ -215,7 +215,31 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    std::process::ExitCode::from(code as u8)
+    // `std::process::exit`, not `return ExitCode::from(...)` -- found by
+    // hitting a real hang: `tokio::io::stdin()` reads via an internal
+    // background OS thread (needed cross-platform, since e.g. a Windows
+    // console handle isn't natively pollable), and once attach/push/etc.
+    // are done with stdin, that thread is typically still blocked inside
+    // a synchronous read() waiting for the next byte that may never come
+    // (a real terminal with nothing more typed into it, or non-
+    // interactive/piped stdin that was never closed). Returning `ExitCode`
+    // normally drops the `#[tokio::main]`-generated `Runtime` -- and that
+    // drop waits for every spawned/blocking task to actually finish,
+    // including that stuck thread -- so the process would sit alive
+    // (confirmed via a debug trace: this exact point was reached in well
+    // under 300ms, yet the OS process didn't exit until something -- a
+    // keystroke, a closed pipe -- eventually unblocked that unrelated
+    // read()) long after every byte of real work, including printing the
+    // outcome above, was already done. `std::process::exit` skips that
+    // wait entirely: it terminates every thread immediately, which is
+    // exactly what's wanted here since nothing left to do depends on
+    // graceful async cleanup -- the raw-mode guard already restored the
+    // terminal via its own `Drop` before this point, further up the call
+    // stack.
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(code);
 }
 
 fn build_spawn_request(
@@ -270,6 +294,34 @@ async fn cmd_attach(session: &str, detach_char: Option<u8>, quiet: bool) -> i32 
     cmd_attach_replayed(session, &socket_path, detach_char, replayed, quiet).await
 }
 
+/// Process exit code for `AttachOutcome::SessionEnded` -- the hosted
+/// program actually exited (or the daemon went away), as opposed to the
+/// user just detaching or local stdin running dry. Distinct from every
+/// other outcome specifically so a wrapper script can tell them apart: the
+/// remote-server auto-attach hook documented in the README's "Setting up
+/// on a remote server" section checks for exactly this value to decide
+/// whether to `exit` the shell that invoked `hytch` too -- propagating a
+/// real session end into an actual logout, the way it would with no
+/// multiplexer in the way at all, instead of silently dropping back to an
+/// inner shell prompt that looks indistinguishable from a hang. Detaching
+/// (0) must never trigger that -- the whole point of `^\` is that the SSH
+/// connection stays open.
+const EXIT_SESSION_ENDED: i32 = 90;
+
+fn exit_code_for_outcome(outcome: hytch_client::AttachOutcome) -> i32 {
+    use hytch_client::AttachOutcome;
+    match outcome {
+        AttachOutcome::SessionEnded => EXIT_SESSION_ENDED,
+        // Detached: the session lives on, nothing to report. Suspended:
+        // caller-level ^Z orchestration isn't wired up yet (see
+        // AttachOptions::suspend_char's doc comment), so this can't
+        // currently be reached from here -- treated as benign either way.
+        // InputClosed: local-only signal, says nothing about whether the
+        // remote session survived -- must not be treated like a real end.
+        AttachOutcome::Detached | AttachOutcome::Suspended | AttachOutcome::InputClosed => 0,
+    }
+}
+
 async fn cmd_attach_replayed(
     session: &str,
     socket_path: &std::path::Path,
@@ -278,7 +330,7 @@ async fn cmd_attach_replayed(
     quiet: bool,
 ) -> i32 {
     match attach::attach_foreground(socket_path, detach_char, replayed, quiet).await {
-        Ok(_) => 0,
+        Ok(outcome) => exit_code_for_outcome(outcome),
         Err(e) => {
             commands::print_connect_error(session, &e);
             1
@@ -411,4 +463,27 @@ fn cmd_rm(all: bool, session: Option<String>, quiet: bool) -> i32 {
     let socket_path = paths::socket_path(&name);
     let log_path = paths::log_path_for(&socket_path);
     commands::rm(&socket_path, &log_path, &name, quiet)
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::*;
+    use hytch_client::AttachOutcome;
+
+    #[test]
+    fn session_ended_gets_its_own_distinct_exit_code() {
+        assert_eq!(
+            exit_code_for_outcome(AttachOutcome::SessionEnded),
+            EXIT_SESSION_ENDED
+        );
+        assert_ne!(EXIT_SESSION_ENDED, 0);
+    }
+
+    #[test]
+    fn detach_and_local_input_eof_are_both_a_plain_zero() {
+        // Neither one means the remote session ended -- must never be
+        // confused with EXIT_SESSION_ENDED by a wrapper script.
+        assert_eq!(exit_code_for_outcome(AttachOutcome::Detached), 0);
+        assert_eq!(exit_code_for_outcome(AttachOutcome::InputClosed), 0);
+    }
 }

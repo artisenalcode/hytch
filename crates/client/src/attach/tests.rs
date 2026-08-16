@@ -25,10 +25,10 @@ async fn keystrokes_forwarded_and_daemon_output_written_verbatim() {
     input_writer.write_all(b"hello").await.unwrap();
     // Deliberately NOT dropping input_writer here: doing so immediately
     // gives the client an EOF on stdin, which is itself a valid
-    // SessionEnded trigger and would race ahead of the daemon's response
+    // InputClosed trigger and would race ahead of the daemon's response
     // below, making the test nondeterministic. Keep it alive until the
     // function ends -- the client's own conn EOF (from the daemon side
-    // closing) is what should end this test's run().
+    // closing) is what should end this test's run() with SessionEnded.
 
     let daemon = tokio::spawn(async move {
         let (daemon_read, mut daemon_write) = split(conn_daemon);
@@ -69,6 +69,55 @@ async fn keystrokes_forwarded_and_daemon_output_written_verbatim() {
     let mut captured = Vec::new();
     output_reader.read_to_end(&mut captured).await.unwrap();
     assert_eq!(captured, b"echo-back");
+}
+
+#[tokio::test]
+async fn local_stdin_eof_reports_input_closed_not_session_ended() {
+    // The distinction this test locks in: local stdin running dry (a
+    // script piping `< file` into hytch, or just this test dropping the
+    // writer) says nothing about whether the *remote* session is still
+    // alive -- the daemon here never closes its end. A caller (the `cli`
+    // crate) uses this to decide whether to propagate "log off" -- doing
+    // that on InputClosed would be wrong, since the hosted program hasn't
+    // actually exited.
+    let (input_writer, input_reader) = tokio::io::duplex(64);
+    let (output_writer, _output_reader) = tokio::io::duplex(64);
+    let (conn_client, conn_daemon) = tokio::io::duplex(4096);
+    let (client_read, client_write) = split(conn_client);
+
+    drop(input_writer); // immediate local EOF, before anything else happens
+
+    let daemon = tokio::spawn(async move {
+        let (daemon_read, _daemon_write) = split(conn_daemon);
+        let mut framed = FramedRead::new(daemon_read, MessageCodec::default());
+        assert!(matches!(
+            framed.next().await.unwrap().unwrap(),
+            Message::Attach { .. }
+        ));
+        assert!(matches!(
+            framed.next().await.unwrap().unwrap(),
+            Message::Redraw { .. }
+        ));
+        // Deliberately not dropping conn_daemon (or _daemon_write) here --
+        // if the outcome below came from the daemon side closing instead
+        // of the local stdin EOF, that would defeat the point of this
+        // test. Held alive until the task ends, well past run()'s return.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    });
+
+    let outcome = run(
+        input_reader,
+        output_writer,
+        client_read,
+        client_write,
+        None,
+        opts(Some(0x1c), None),
+    )
+    .await
+    .unwrap();
+
+    daemon.await.unwrap();
+    assert_eq!(outcome, AttachOutcome::InputClosed);
 }
 
 #[tokio::test]
