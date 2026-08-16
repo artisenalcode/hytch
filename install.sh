@@ -4,14 +4,28 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/artisenalcode/hytch/main/install.sh | bash
 #
+# Installs to /usr/local/bin by default -- one canonical location on PATH
+# for every shell (interactive, login, and the non-interactive shell an
+# `ssh host "hytch ..."` remote command runs under), not just the ones that
+# source a user rc file. A split between a user-writable dir and a
+# root-owned one is exactly how a stale, unfixed binary hid in the other
+# location during real use (a non-interactive SSH session resolved a
+# different `hytch` than the interactive shell did) -- one location removes
+# the ambiguity instead of trading it for a different one.
+#
+# Not writable by the invoking user (true for /usr/local/bin under a normal
+# account) -- re-execs itself under `sudo`, once, the same way rustup's
+# installer elevates only the final privileged step rather than requiring
+# the whole pipeline to run as root.
+#
 # Env vars:
 #   HYTCH_VERSION      release tag to install, e.g. "v0.1.0" (default: latest)
-#   HYTCH_INSTALL_DIR  install directory (default: $HOME/.local/bin)
+#   HYTCH_INSTALL_DIR  install directory (default: /usr/local/bin)
 
 set -euo pipefail
 
 repo="artisenalcode/hytch"
-install_dir="${HYTCH_INSTALL_DIR:-$HOME/.local/bin}"
+install_dir="${HYTCH_INSTALL_DIR:-/usr/local/bin}"
 version="${HYTCH_VERSION:-latest}"
 
 os="$(uname -s)"
@@ -47,8 +61,18 @@ fi
 
 tar -xzf "${tmpdir}/hytch.tgz" -C "$tmpdir" hytch
 
-mkdir -p "$install_dir"
-install -m 755 "${tmpdir}/hytch" "${install_dir}/hytch"
+# Try as the invoking user first; a custom HYTCH_INSTALL_DIR is often
+# user-writable and shouldn't need sudo just because the default location
+# sometimes does. Only escalate on an actual permission failure.
+if ! { mkdir -p "$install_dir" && install -m 755 "${tmpdir}/hytch" "${install_dir}/hytch"; } 2>/dev/null; then
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "hytch: ${install_dir} isn't writable and 'sudo' isn't available -- set HYTCH_INSTALL_DIR to a writable directory instead." >&2
+    exit 1
+  fi
+  echo "hytch: ${install_dir} needs elevated privileges -- retrying with sudo"
+  sudo mkdir -p "$install_dir"
+  sudo install -m 755 "${tmpdir}/hytch" "${install_dir}/hytch"
+fi
 
 echo "hytch: installed to ${install_dir}/hytch"
 "${install_dir}/hytch" --version
