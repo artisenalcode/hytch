@@ -116,13 +116,23 @@ rm -rf ~/.cache/hytch            # session sockets + logs, if you want them gone
    # dropping you back at a normal prompt in the same connection.
    if [[ -n "$SSH_TTY" && -z "$HYTCH_SESSION" && $- == *i* ]]; then
      hytch main
+     # Exit code 90 means the hosted shell actually exited (you typed
+     # `exit`/^D), not that you merely detached (^\, exit code 0) --
+     # propagate that into a real logout, the same as it would with no
+     # session tool in the way at all. Detaching must NOT hit this: the
+     # whole point of ^\ is that the SSH connection stays open.
+     [[ $? -eq 90 ]] && exit
    fi
    ```
 
 3. `ssh you@your-server` — you're now in a resumable session. `^\` to
-   detach (back to a normal prompt, same connection); close the terminal
-   or lose the connection outright and the session just keeps running.
-   Next login reattaches automatically.
+   detach (back to a normal prompt, same connection, `main` keeps running
+   in the background); type `exit` (or ^D) at the shell instead and you're
+   logged off for real, same as a normal SSH session with no multiplexer
+   involved — that shell *was* the whole session, so there's nothing left
+   to detach to. Close the terminal or lose the connection outright
+   instead of either one and the session just keeps running; next login
+   reattaches automatically.
 
 No client-side install needed for this — the terminal you SSH from just
 needs a normal SSH client. `hytch` only needs to run on the server; the
