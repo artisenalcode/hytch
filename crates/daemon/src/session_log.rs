@@ -14,20 +14,99 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+/// How far before a naive tail cut we're willing to look for an unterminated
+/// ANSI escape sequence that the cut would otherwise split in half. Real
+/// terminal escape sequences (cursor movement, SGR/color, mode toggles) are
+/// short; this comfortably covers them without meaningfully loosening the
+/// size cap. Found by replaying a real corrupted log in production: a raw
+/// byte-offset trim landed mid-sequence and desynced the terminal parser for
+/// everything replayed after it -- lost color state, garbage glyphs, "no
+/// color, strange ascii" on every subsequent reattach.
+const ESCAPE_LOOKBACK: usize = 64;
+
 /// Trim `file` in place to at most its last `max_size` bytes, if it
 /// currently exceeds that. Leaves the file position at EOF either way.
+///
+/// The cut point is nudged to the nearest safe boundary -- never inside a
+/// multi-byte UTF-8 character, never inside an unterminated ANSI escape
+/// sequence -- so a cold replay of the result starts the terminal's parser
+/// in a state it can actually make sense of. A raw byte-offset cut can land
+/// mid-CSI-sequence (its tail then prints as literal garbage and eats
+/// whatever real content follows, until a stray byte happens to look like a
+/// terminator) or mid-UTF-8-char (renders as replacement-character mojibake)
+/// -- either one corrupts the *entire* rest of the replay, not just the cut
+/// point, because the terminal's escape-sequence parser is left in the
+/// wrong state. This can grow the trimmed file slightly past `max_size`
+/// (by at most `ESCAPE_LOOKBACK` bytes, to keep a split sequence intact) --
+/// a deliberate, bounded tradeoff for a log that's actually safe to replay.
 pub fn rotate_log_file(file: &mut File, max_size: u64) -> io::Result<()> {
     let size = file.seek(SeekFrom::End(0))?;
     if size > max_size {
-        let mut tail = vec![0u8; max_size as usize];
-        file.seek(SeekFrom::Start(size - max_size))?;
-        let n = file.read(&mut tail)?;
+        let naive_start = size - max_size;
+        let lookback = ESCAPE_LOOKBACK.min(naive_start as usize) as u64;
+        let read_start = naive_start - lookback;
+
+        let mut buf = vec![0u8; (max_size + lookback) as usize];
+        file.seek(SeekFrom::Start(read_start))?;
+        let n = file.read(&mut buf)?;
+        buf.truncate(n);
+
+        let safe_start = safe_trim_start(&buf, lookback as usize);
+        let tail = &buf[safe_start..];
+
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
-        file.write_all(&tail[..n])?;
+        file.write_all(tail)?;
     }
     file.seek(SeekFrom::End(0))?;
     Ok(())
+}
+
+/// Find the nearest safe place at or before `naive_cut` (within
+/// `ESCAPE_LOOKBACK` bytes) to start the trimmed tail. Two hazards, checked
+/// in order:
+///
+/// 1. `naive_cut` lands inside an unterminated escape sequence that started
+///    in the lookback window -- move the start back to the `ESC` byte so
+///    the whole sequence survives intact.
+/// 2. `naive_cut` lands on a UTF-8 continuation byte -- skip forward to the
+///    start of the next full character.
+///
+/// These can't both apply (an escape sequence is ASCII-only), so the escape
+/// check runs first and returns early when it fires.
+fn safe_trim_start(buf: &[u8], naive_cut: usize) -> usize {
+    let lookback_start = naive_cut.saturating_sub(ESCAPE_LOOKBACK);
+    let esc = buf[lookback_start..naive_cut]
+        .iter()
+        .rposition(|&b| b == 0x1b)
+        .map(|rel| lookback_start + rel);
+    if let Some(esc_pos) = esc
+        && !escape_sequence_terminated(&buf[esc_pos..naive_cut])
+    {
+        return esc_pos;
+    }
+
+    let mut start = naive_cut;
+    while start < buf.len() && buf[start] & 0xc0 == 0x80 {
+        start += 1;
+    }
+    start
+}
+
+/// Whether the escape sequence starting at `seq[0]` (`ESC`) is already
+/// closed within `seq`. Covers the two shapes that actually show up in real
+/// terminal output: CSI (`ESC [ params... final-byte`) and short two-byte
+/// escapes (`ESC c`, `ESC 7`, `ESC =`, ...). OSC sequences (`ESC ]
+/// ... BEL`/`ST`, used for e.g. window-title setting) aren't handled --
+/// rare enough in typical TUI output that treating them as terminated is an
+/// accepted simplification, not a silent gap: worst case for those is the
+/// pre-fix behavior for that one sequence, not a regression.
+fn escape_sequence_terminated(seq: &[u8]) -> bool {
+    match seq.get(1) {
+        Some(b'[') => seq[2..].iter().any(|&b| (0x40..=0x7e).contains(&b)),
+        Some(_) => true,
+        None => false,
+    }
 }
 
 /// A session's persistent on-disk log: open, append (with rotation once the
@@ -75,7 +154,11 @@ impl SessionLog {
         self.current_size += data.len() as u64;
         if self.current_size > self.max_size {
             rotate_log_file(&mut self.file, self.max_size)?;
-            self.current_size = self.max_size;
+            // Not necessarily exactly `max_size` any more: a safe trim can
+            // grow the file slightly past the cap to keep an escape
+            // sequence intact (see `rotate_log_file`), so read the real
+            // post-trim length back rather than assuming the cap.
+            self.current_size = self.file.metadata()?.len();
         }
         Ok(())
     }

@@ -48,6 +48,53 @@ fn rotate_trims_oversized_file_to_the_tail() {
 }
 
 #[test]
+fn rotate_does_not_split_an_unterminated_escape_sequence() {
+    // "AB" + a cursor-position CSI sequence (ESC [ 1 2 3 G) + "XYZW". A
+    // naive last-6-bytes cut lands as "3GXYZW" -- the escape sequence's
+    // opening `ESC [ 1 2` is gone, so a terminal replaying this sees the
+    // literal text "3GXYZW" instead of a cursor move, and (in the general
+    // case, not this specific sequence) can end up consuming real
+    // following bytes as bogus parameters. The fix must widen the cut left
+    // to the `ESC` byte so the whole sequence survives intact.
+    let mut tmp = NamedTempFile::new().unwrap();
+    tmp.write_all(b"AB\x1b[123GXYZW").unwrap(); // 12 bytes
+    rotate_log_file(tmp.as_file_mut(), 6).unwrap();
+
+    assert_eq!(read_all(tmp.path()), b"\x1b[123GXYZW");
+}
+
+#[test]
+fn rotate_does_not_split_a_multibyte_utf8_character() {
+    // "AB" + the 3-byte UTF-8 box-drawing char U+2500 (0xe2 0x94 0x80) +
+    // "XYZW". A naive last-6-bytes cut starts one byte into that
+    // character (a continuation byte), which is invalid UTF-8 on its own
+    // and renders as replacement-character mojibake. The fix must skip
+    // forward to the start of the next full character instead.
+    let mut tmp = NamedTempFile::new().unwrap();
+    tmp.write_all("AB\u{2500}XYZW".as_bytes()).unwrap(); // 2 + 3 + 4 = 9 bytes
+    rotate_log_file(tmp.as_file_mut(), 6).unwrap();
+
+    let out = read_all(tmp.path());
+    assert!(
+        std::str::from_utf8(&out).is_ok(),
+        "trimmed tail must be valid UTF-8, got {out:?}"
+    );
+    assert_eq!(out, "XYZW".as_bytes());
+}
+
+#[test]
+fn rotate_with_no_unsafe_boundary_still_cuts_exactly_at_the_cap() {
+    // Baseline: when the naive cut point doesn't land inside anything
+    // unsafe, behavior is unchanged from a plain byte-offset trim -- the
+    // safety logic shouldn't widen cuts that don't need it.
+    let mut tmp = NamedTempFile::new().unwrap();
+    tmp.write_all(b"0123456789").unwrap();
+    rotate_log_file(tmp.as_file_mut(), 4).unwrap();
+
+    assert_eq!(read_all(tmp.path()), b"6789");
+}
+
+#[test]
 fn rotate_leaves_cursor_at_eof_ready_for_append() {
     let mut tmp = NamedTempFile::new().unwrap();
     tmp.write_all(b"0123456789").unwrap();
