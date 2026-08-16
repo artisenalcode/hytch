@@ -10,6 +10,7 @@ name = "hytch_proto"
 
 [dependencies]
 bytes.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
