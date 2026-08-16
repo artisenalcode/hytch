@@ -1,14 +1,8 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! The `hytch` session daemon: pty management, scrollback ring buffer,
+//! on-disk session log, and client fanout.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod ring_buffer;
+pub mod session_log;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use ring_buffer::RingBuffer;
+pub use session_log::SessionLog;
