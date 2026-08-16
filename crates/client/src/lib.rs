@@ -1,14 +1,8 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Attach-side: raw terminal mode and the steady-state attach loop.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod attach;
+pub mod raw_mode;
+pub mod resize;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use attach::{AttachOptions, AttachOutcome, run};
+pub use raw_mode::RawModeGuard;

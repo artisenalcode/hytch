@@ -11,3 +11,12 @@ name = "hytch_client"
 [dependencies]
 hytch-proto = { path = "../proto" }
 hytch-session = { path = "../session" }
+tokio.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+rustix.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio-stream = "0.1"
