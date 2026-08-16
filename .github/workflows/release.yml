@@ -1,94 +1,20 @@
 name: Release
 
+# Manual release path: push a `vX.Y.Z` tag yourself (see README's
+# "Versioning & releases"). The normal path is auto-version.yml, which
+# bumps and tags on every push to main and calls the same build --
+# this stays around for cutting a release from a tag by hand (e.g.
+# re-releasing an old commit, or a version bump that isn't a plain patch).
+
 on:
   push:
     tags:
       - "v*.*.*"
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  # Fails fast, before spending any build minutes, if the pushed tag and
-  # Cargo.toml's [workspace.package] version have drifted apart -- the
-  # single source of truth is Cargo.toml; the tag is just how a release is
-  # triggered, and `hytch --version` at runtime is compiled from Cargo.toml,
-  # not from the tag. Without this check, `--version` could silently print
-  # something other than the tag a user actually downloaded.
-  check-version:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Tag must match Cargo.toml's workspace version
-        run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          cargo_version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-          echo "tag: $tag_version, Cargo.toml: $cargo_version"
-          if [ "$tag_version" != "$cargo_version" ]; then
-            echo "::error::Tag v$tag_version does not match Cargo.toml version $cargo_version"
-            exit 1
-          fi
-
-  build:
-    needs: check-version
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            arch: amd64
-          - target: aarch64-unknown-linux-musl
-            arch: arm64
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      # rustix's default linux_raw backend needs no libc at all, so the
-      # only cross-compilation dependency here is a linker that can target
-      # aarch64 -- Rust ships self-contained musl crt objects for both
-      # targets already. Verified locally that x86_64-unknown-linux-musl
-      # builds and runs with zero extra toolchain (see BENCHMARKS.md /
-      # commit history); aarch64 needs this cross-linker because the dev
-      # machine this was built on is x86_64-only.
-      - name: Install aarch64 cross-linker
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Build
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }} -p hytch
-
-      - name: Package
-        run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/hytch dist/hytch
-          tar -C dist -czf hytch-linux-${{ matrix.arch }}.tgz hytch
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: hytch-linux-${{ matrix.arch }}
-          path: hytch-linux-${{ matrix.arch }}.tgz
-
   release:
-    needs: build
-    runs-on: ubuntu-latest
+    uses: ./.github/workflows/_release-build.yml
+    with:
+      tag: ${{ github.ref_name }}
     permissions:
       contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*.tgz
-          generate_release_notes: true

@@ -1,0 +1,98 @@
+name: Auto-version
+
+# Every commit landing on main bumps [workspace.package].version in
+# Cargo.toml (the single source of truth -- see release.yml and
+# BENCHMARKS.md's neighbor, the README's "Versioning & releases"), commits
+# and tags that bump, then builds and publishes the release directly --
+# same as running the manual `git tag vX.Y.Z && git push origin vX.Y.Z`
+# flow, just automatic.
+#
+# Defaults to a patch bump. A commit message containing `[minor]` or
+# `[major]` bumps that field instead (and zeroes the ones below it) --
+# e.g. a merge-commit/PR title of "Add hytch tail [minor]".
+#
+# Calls straight into _release-build.yml rather than relying on the tag
+# push (below) re-triggering release.yml: pushes made with the default
+# GITHUB_TOKEN deliberately don't fire new workflow runs (GitHub's own
+# loop-prevention, which is also what stops *this* workflow from
+# re-triggering itself on the bump commit it pushes).
+#
+# Skips entirely on a commit this workflow made itself -- belt-and-braces
+# alongside the GITHUB_TOKEN loop-prevention above, in case a run is
+# manually re-triggered or that behavior ever changes.
+
+on:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bump:
+    if: ${{ github.event.head_commit != null && !startsWith(github.event.head_commit.message, 'chore(release):') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compute and apply the version bump
+        id: bump
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+
+          current=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          IFS='.' read -r major minor patch <<< "$current"
+
+          if grep -qF '[major]' <<< "$COMMIT_MSG"; then
+            bump=major
+          elif grep -qF '[minor]' <<< "$COMMIT_MSG"; then
+            bump=minor
+          else
+            bump=patch
+          fi
+
+          case "$bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          new_version="$major.$minor.$patch"
+          echo "$current -> $new_version ($bump)"
+
+          # Only the [workspace.package] version line -- member crates use
+          # `version.workspace = true`, not a literal `version = "..."`,
+          # so this can't collide with anything else in the file. `0,/re/`
+          # additionally caps it to the first match only, as a backstop.
+          sed -i "0,/^version = \"${current}\"/s//version = \"${new_version}\"/" Cargo.toml
+
+          # Regenerate Cargo.lock's own version entries for the local
+          # workspace members (hytch, hytch-proto, ...) to match --
+          # doesn't touch any external dependency, all of those are
+          # already fully resolved.
+          cargo check --workspace --quiet
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(release): v${new_version}"
+          git tag "v${new_version}"
+          git push origin HEAD:main
+          git push origin "v${new_version}"
+
+          echo "tag=v${new_version}" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: bump
+    uses: ./.github/workflows/_release-build.yml
+    with:
+      tag: ${{ needs.bump.outputs.tag }}
+    permissions:
+      contents: write

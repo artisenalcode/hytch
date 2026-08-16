@@ -275,16 +275,26 @@ CI (`.github/workflows/ci.yml`) runs fmt/clippy/build/test on every push.
 [Semantic versioning](https://semver.org). `[workspace.package].version` in
 `Cargo.toml` is the single source of truth — `hytch --version` is compiled
 from it directly, plus a build-time git commit hash (`build.rs`) for exact
-provenance on a downloaded binary. To cut a release:
+provenance on a downloaded binary.
+
+**Automatic (the normal path):** every commit landing on `main` gets a
+release with no action needed. `.github/workflows/auto-version.yml` bumps
+`Cargo.toml`'s `version` (default: patch), commits that as `chore(release):
+vX.Y.Z`, tags it, and calls straight into the same build/publish steps
+`release.yml` uses — cross-compiling static musl binaries for `x86_64` and
+`aarch64` and publishing them as `.tgz` assets on a GitHub release. Put
+`[minor]` or `[major]` in the commit/PR-title message to bump that field
+instead (e.g. `Add hytch tail [minor]`); anything else is a patch bump.
+
+**Manual (cutting a release from an arbitrary commit or tag):**
 
 1. Bump `version` in `Cargo.toml`.
 2. Commit, then tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-3. `.github/workflows/release.yml` triggers on the `v*.*.*` tag. Its first
-   job fails the whole run immediately if the tag doesn't match
-   `Cargo.toml`'s version — a release can never ship with a `--version`
-   that disagrees with the tag it came from. It then cross-compiles static
-   musl binaries for `x86_64` and `aarch64` and publishes them as `.tgz`
-   assets on a GitHub release.
+3. `.github/workflows/release.yml` triggers on the `v*.*.*` tag and calls
+   the same reusable `_release-build.yml` workflow. Its first job fails the
+   whole run immediately if the tag doesn't match `Cargo.toml`'s version —
+   a release can never ship with a `--version` that disagrees with the tag
+   it came from.
 
 ## Licensing
 
