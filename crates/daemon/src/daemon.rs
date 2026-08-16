@@ -13,11 +13,16 @@ use hytch_proto::{Message, MessageCodec, RedrawMethod};
 use rustix::process::Signal;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
+
+/// How long a single push chunk gets to drain into the pty before this loop
+/// gives up on it and moves on -- see the doc comment where this is used.
+const PTY_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub struct DaemonConfig {
     pub socket_path: PathBuf,
@@ -44,8 +49,10 @@ pub enum ShutdownReason {
     DaemonSignaled,
 }
 
-enum PtyCommand {
-    Push(Bytes),
+/// Resize/signal, on their own small channel, checked with priority over
+/// push data in the main select loop (see where it's polled for why: a
+/// stuck push write must never be able to delay a kill).
+enum ControlCommand {
     Resize(u16, u16),
     Signal(Signal),
 }
@@ -102,7 +109,13 @@ pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
     };
 
     let listener = bind_listener(&config.socket_path)?;
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<PtyCommand>(256);
+    // Two channels, not one: push data is bulky and can legitimately queue
+    // up (and each chunk is now individually time-bounded, see below), but
+    // Resize/Signal must never be able to get stuck behind a backlog of it
+    // -- a kill needs to stay fast regardless of how much unread push data
+    // is queued ahead of it.
+    let (push_tx, mut push_rx) = mpsc::channel::<Bytes>(256);
+    let (control_tx, mut control_rx) = mpsc::channel::<ControlCommand>(16);
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -117,17 +130,33 @@ pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
     let mut buf = [0u8; 4096];
     let reason = loop {
         tokio::select! {
-            accepted = listener.accept() => {
-                if let Ok((stream, _)) = accepted {
-                    tracing::debug!("client connected");
-                    tokio::spawn(handle_client(stream, fanout.clone(), cmd_tx.clone()));
-                }
-            }
-            cmd = cmd_rx.recv() => {
+            // biased, in this specific order -- each one deliberate:
+            //
+            // 1. control (resize/kill) first, always -- combined with the
+            //    write timeout below, this bounds worst-case kill latency
+            //    to about one PTY_WRITE_TIMEOUT regardless of how much
+            //    push data is already queued ahead of it.
+            // 2. pty.read() SECOND, ahead of push -- this is what actually
+            //    fixes the bug the ordering below it exists to work around.
+            //    Once a killed (or otherwise-exited) child's pty slave
+            //    fully closes, further writes from the push branch fail
+            //    *immediately* instead of timing out -- so with push
+            //    checked before read, a still-refilling push backlog
+            //    (client mid-stream) made this loop spin through failing
+            //    writes at high CPU indefinitely, never reaching the read
+            //    branch that would notice the child was gone and clean up.
+            //    Found by hitting exactly that after fixing the timeout:
+            //    kill still "didn't stop" the session, but this time
+            //    because the daemon was pegged at ~90% CPU busy-looping,
+            //    not blocked.
+            // 3. accept, then push last -- new connections and control
+            //    messages both matter more than draining bulk data.
+            biased;
+
+            cmd = control_rx.recv() => {
                 match cmd {
-                    Some(PtyCommand::Push(data)) => { let _ = pty.write_all(&data).await; }
-                    Some(PtyCommand::Resize(rows, cols)) => { let _ = pty.resize(rows, cols); }
-                    Some(PtyCommand::Signal(sig)) => { let _ = pty.signal(sig); }
+                    Some(ControlCommand::Resize(rows, cols)) => { let _ = pty.resize(rows, cols); }
+                    Some(ControlCommand::Signal(sig)) => { let _ = pty.signal(sig); }
                     None => {} // all senders dropped; harmless, keep looping
                 }
             }
@@ -145,6 +174,37 @@ pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
                 }
                 let status = pty.wait().await.ok();
                 break ShutdownReason::ChildExited(status.and_then(|s| s.code()));
+            }
+            accepted = listener.accept() => {
+                if let Ok((stream, _)) = accepted {
+                    tracing::debug!("client connected");
+                    tokio::spawn(handle_client(stream, fanout.clone(), push_tx.clone(), control_tx.clone()));
+                }
+            }
+            data = push_rx.recv() => {
+                let Some(data) = data else { continue }; // all senders dropped; harmless
+                // Bounded, deliberately: a write that blocks indefinitely
+                // (a real, easily reached case -- push more than the
+                // pty's small kernel input buffer, typically ~11KB, to a
+                // child that never reads its stdin, e.g. `sleep`) would
+                // otherwise stall this branch forever. The `biased`
+                // control-channel priority above is what keeps a kill
+                // responsive *between* chunks; this timeout is what
+                // guarantees there's always a "between" to get to.
+                // Dropping the unwritten remainder and logging a warning
+                // trades perfect delivery to a child that isn't reading
+                // anyway for the loop always staying responsive -- the
+                // same trade a real terminal makes structurally
+                // differently (a signal-generating keystroke bypasses the
+                // input queue entirely at the line-discipline level,
+                // which hytch's push path has no equivalent of).
+                match tokio::time::timeout(PTY_WRITE_TIMEOUT, pty.write_all(&data)).await {
+                    Ok(_) => {}
+                    Err(_) => tracing::warn!(
+                        bytes = data.len(),
+                        "pty write did not drain in time (child not reading stdin?), dropping this chunk"
+                    ),
+                }
             }
             _ = sigterm.recv() => break ShutdownReason::DaemonSignaled,
             _ = sigint.recv() => break ShutdownReason::DaemonSignaled,
@@ -222,7 +282,8 @@ async fn recv_next(
 async fn handle_client(
     stream: tokio::net::UnixStream,
     fanout: Arc<Fanout>,
-    cmd_tx: mpsc::Sender<PtyCommand>,
+    push_tx: mpsc::Sender<Bytes>,
+    control_tx: mpsc::Sender<ControlCommand>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut framed = FramedRead::new(read_half, MessageCodec::default());
@@ -245,18 +306,18 @@ async fn handle_client(
                         attached = None;
                     }
                     Some(Ok(Message::Push(data))) => {
-                        if cmd_tx.send(PtyCommand::Push(data)).await.is_err() {
+                        if push_tx.send(data).await.is_err() {
                             return;
                         }
                     }
                     Some(Ok(Message::Winch { rows, cols })) => {
-                        if cmd_tx.send(PtyCommand::Resize(rows, cols)).await.is_err() {
+                        if control_tx.send(ControlCommand::Resize(rows, cols)).await.is_err() {
                             return;
                         }
                     }
                     Some(Ok(Message::Redraw { method, rows, cols })) => {
                         if method != RedrawMethod::None
-                            && cmd_tx.send(PtyCommand::Resize(rows, cols)).await.is_err()
+                            && control_tx.send(ControlCommand::Resize(rows, cols)).await.is_err()
                         {
                             return;
                         }
@@ -268,7 +329,7 @@ async fn handle_client(
                     Some(Ok(Message::Kill { signal })) => {
                         tracing::info!(signal, "kill requested");
                         let sig = Signal::from_raw(signal as i32).unwrap_or(Signal::Term);
-                        if cmd_tx.send(PtyCommand::Signal(sig)).await.is_err() {
+                        if control_tx.send(ControlCommand::Signal(sig)).await.is_err() {
                             return;
                         }
                     }

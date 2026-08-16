@@ -157,3 +157,40 @@ async fn kill_message_terminates_child_and_daemon_cleans_up() {
     );
     assert!(log_path.exists(), "log file should still exist on disk");
 }
+
+#[tokio::test]
+async fn kill_stays_responsive_even_behind_a_stuck_push_backlog() {
+    // Regression test for a real bug: pushing more than the pty's small
+    // kernel input buffer (~11KB on Linux) to a child that never reads its
+    // stdin (like `sleep`) blocks pty writes indefinitely at the OS level.
+    // Kill has to travel through the same daemon loop that owns those
+    // writes -- without the write timeout + control-channel priority this
+    // test locks in, a kill sent while a push is stuck behind a
+    // non-draining child took 7+ seconds and still failed ("did not
+    // stop"), and a second bug (found while fixing the first) made it
+    // busy-loop at ~90% CPU forever instead of even that, once the timeout
+    // let writes fail fast after the child died but push was still
+    // checked ahead of pty reads in the select.
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(&dir, "sleep", &["30"], false);
+    let socket_path = config.socket_path.clone();
+    let handle = tokio::spawn(run(config));
+
+    let mut pusher = connect_with_retries(&socket_path).await;
+    // Comfortably more than the pty's real buffer (a handful of KB) --
+    // several 60KB frames, each near the proto's own max frame size.
+    for _ in 0..8 {
+        send(&mut pusher, Message::Push(bytes::Bytes::from(vec![b'x'; 60_000]))).await;
+    }
+
+    let mut killer = connect_with_retries(&socket_path).await;
+    send(&mut killer, Message::Kill { signal: 9 }).await;
+
+    let reason = tokio::time::timeout(Duration::from_secs(3), handle)
+        .await
+        .expect("daemon must stay responsive to kill even behind a stuck push backlog")
+        .expect("daemon task panicked")
+        .expect("daemon returned an error");
+
+    assert!(matches!(reason, ShutdownReason::ChildExited(_)));
+}
