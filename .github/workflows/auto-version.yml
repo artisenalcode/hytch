@@ -7,9 +7,16 @@ name: Auto-version
 # same as running the manual `git tag vX.Y.Z && git push origin vX.Y.Z`
 # flow, just automatic.
 #
-# Defaults to a patch bump. A commit message containing `[minor]` or
-# `[major]` bumps that field instead (and zeroes the ones below it) --
-# e.g. a merge-commit/PR title of "Add hytch tail [minor]".
+# Defaults to a patch bump. `[minor]` or `[major]` in the commit's
+# *subject line only* (not the full body) bumps that field instead (and
+# zeroes the ones below it) -- e.g. a merge-commit/PR title of "Add hytch
+# tail [minor]". Subject-only is deliberate, not just the first thing that
+# worked: this workflow's own commit history is full of *prose describing*
+# these markers (like the paragraph above), and matching the full commit
+# body means a commit message that explains this feature detonates it --
+# which is exactly what happened bootstrapping this workflow (an
+# explanatory "[major]" in this commit's own body silently shipped v1.0.0
+# instead of a patch bump).
 #
 # Calls straight into _release-build.yml rather than relying on the tag
 # push (below) re-triggering release.yml: pushes made with the default
@@ -52,9 +59,12 @@ jobs:
           current=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
           IFS='.' read -r major minor patch <<< "$current"
 
-          if grep -qF '[major]' <<< "$COMMIT_MSG"; then
+          # Subject line only -- see the workflow-level comment above for
+          # why the full multi-line body is not safe to grep here.
+          subject=$(head -n1 <<< "$COMMIT_MSG")
+          if grep -qF '[major]' <<< "$subject"; then
             bump=major
-          elif grep -qF '[minor]' <<< "$COMMIT_MSG"; then
+          elif grep -qF '[minor]' <<< "$subject"; then
             bump=minor
           else
             bump=patch
