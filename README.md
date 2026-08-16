@@ -20,32 +20,128 @@ hytch work                    # attach — or reattach after any disconnect
 
 ## Status
 
-Functional and end-to-end tested (89 tests, `cargo test --workspace`),
+Functional and end-to-end tested (100 tests, `cargo test --workspace`),
 manually verified against the actual target scenario — start a detached
-session, disconnect, reconnect, see full history. Not yet released as a
-downloadable binary (no tag cut yet — build from source below). See
+session, disconnect, reconnect, see full history — including a real crash
+(`SIGKILL` on the daemon process itself) and a stuck-write scenario that
+was found, fixed, and locked in with a regression test. See
 [Known gaps](#known-gaps) for what's deliberately not built yet.
 
 ## Install
 
-**From source** (works today):
+### Prerequisites
+
+- Linux, x86_64 or aarch64. (macOS/BSD are explicitly out of scope — see
+  the plan doc referenced in [Development](#development).)
+- Nothing else, for the release binary: it's static (musl, no dynamic
+  libc dependency) — copy it anywhere and run it.
+
+### Option 1: scripted install (recommended)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/artisenalcode/hytch/main/install.sh | bash
+```
+
+Downloads the latest release for your architecture, installs to
+`~/.local/bin/hytch`, and tells you if that directory isn't already on your
+`PATH`. Re-running it upgrades in place. Override the version or install
+location with env vars:
+
+```sh
+HYTCH_VERSION=v0.1.0 HYTCH_INSTALL_DIR=/usr/local/bin \
+  curl -fsSL https://raw.githubusercontent.com/artisenalcode/hytch/main/install.sh | bash
+```
+
+> **While this repo is private**, GitHub serves release assets to
+> authenticated requests only — a bare `curl` against a release URL gets a
+> 404, script included. Two working options until/unless the repo goes
+> public:
+>
+> ```sh
+> # Using the GitHub CLI (already authenticated as the repo owner):
+> gh release download --repo artisenalcode/hytch --pattern 'hytch-linux-amd64.tgz'
+> tar -xzf hytch-linux-amd64.tgz hytch
+> install -m 755 hytch ~/.local/bin/hytch
+>
+> # Or build from source (Option 3 below) -- no GitHub auth needed at all.
+> ```
+
+### Option 2: manual release download
+
+```sh
+arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+curl -fsSL -o hytch.tgz \
+  "https://github.com/artisenalcode/hytch/releases/latest/download/hytch-linux-${arch}.tgz"
+tar -xzf hytch.tgz hytch
+install -m 755 hytch ~/.local/bin/hytch   # or /usr/local/bin, with sudo
+```
+
+Pin a specific version by replacing `latest/download` with
+`download/vX.Y.Z` (e.g. `download/v0.1.0`).
+
+### Option 3: from source
 
 ```sh
 git clone https://github.com/artisenalcode/hytch
 cd hytch
 cargo build --release
-sudo cp target/release/hytch /usr/local/bin/
+install -m 755 target/release/hytch ~/.local/bin/hytch
 ```
 
-**From a release** (once a version is tagged — the release workflow builds
-static musl binaries for x86_64 and aarch64 Linux):
+Requires a Rust toolchain (`rustup.rs`); no other build dependencies —
+`rustix`'s default backend talks to the kernel directly, no C toolchain or
+system libraries needed even for the static-musl release target.
+
+### Verify
 
 ```sh
-arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
-curl -Lo hytch.tgz https://github.com/artisenalcode/hytch/releases/latest/download/hytch-linux-${arch}.tgz
-tar -xzf hytch.tgz hytch
-sudo mv hytch /usr/local/bin/
+hytch --version   # e.g. "hytch 0.1.0 (a1b2c3d4)" -- semver + build commit
+hytch list        # "(no sessions)" on a fresh install
 ```
+
+### Upgrade
+
+Re-run whichever install method you used — every option overwrites the
+existing binary in place. A running daemon keeps running under its
+already-loaded old binary until it's next stopped/restarted (killing a
+session and starting a new one, or a reboot); nothing forces existing
+sessions to restart on upgrade.
+
+### Uninstall
+
+```sh
+hytch list                       # make sure nothing's running first
+rm ~/.local/bin/hytch            # or wherever you installed it
+rm -rf ~/.cache/hytch            # session sockets + logs, if you want them gone too
+```
+
+### Setting up on a remote server (the actual use case this exists for)
+
+1. Install with any option above, on the server.
+2. Optional but recommended — auto-attach on SSH login instead of typing
+   `hytch main` every time. Add to `~/.bashrc` / `~/.zshrc` (adjust the
+   syntax for your shell; this is zsh):
+
+   ```sh
+   # On an interactive SSH login with no session yet, resume (or create) a
+   # default session instead of a plain shell. Deliberately not `exec`:
+   # exec-replacing the shell means detaching has nowhere to return to,
+   # so the whole SSH connection would close on detach instead of
+   # dropping you back at a normal prompt in the same connection.
+   if [[ -n "$SSH_TTY" && -z "$HYTCH_SESSION" && $- == *i* ]]; then
+     hytch main
+   fi
+   ```
+
+3. `ssh you@your-server` — you're now in a resumable session. `^\` to
+   detach (back to a normal prompt, same connection); close the terminal
+   or lose the connection outright and the session just keeps running.
+   Next login reattaches automatically.
+
+No client-side install needed for this — the terminal you SSH from just
+needs a normal SSH client. `hytch` only needs to run on the server; the
+raw pty passthrough that keeps your mouse/scroll/colors working travels
+over the same SSH connection you're already using.
 
 ## Usage
 
@@ -187,8 +283,22 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt/clippy/build/test on every push.
-The release workflow (`.github/workflows/release.yml`) builds static musl
-binaries for `x86_64` and `aarch64` on a `v*.*.*` tag push.
+
+### Versioning & releases
+
+[Semantic versioning](https://semver.org). `[workspace.package].version` in
+`Cargo.toml` is the single source of truth — `hytch --version` is compiled
+from it directly, plus a build-time git commit hash (`build.rs`) for exact
+provenance on a downloaded binary. To cut a release:
+
+1. Bump `version` in `Cargo.toml`.
+2. Commit, then tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. `.github/workflows/release.yml` triggers on the `v*.*.*` tag. Its first
+   job fails the whole run immediately if the tag doesn't match
+   `Cargo.toml`'s version — a release can never ship with a `--version`
+   that disagrees with the tag it came from. It then cross-compiles static
+   musl binaries for `x86_64` and `aarch64` and publishes them as `.tgz`
+   assets on a GitHub release.
 
 ## Licensing
 

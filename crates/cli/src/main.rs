@@ -8,9 +8,14 @@ use clap::{Parser, Subcommand};
 use spawn::SpawnRequest;
 use std::path::PathBuf;
 
+/// `<semver> (<short git hash>)`, e.g. `0.1.0 (a1b2c3d4)` -- the hash comes
+/// from build.rs, which falls back to "unknown" rather than failing the
+/// build when `.git` isn't available (a source tarball with no git history).
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("HYTCH_GIT_HASH"), ")");
+
 /// Fast, lean, mouse-transparent terminal session persistence.
 #[derive(Parser)]
-#[command(name = "hytch", version, about)]
+#[command(name = "hytch", version = VERSION, about)]
 struct Cli {
     /// Detach character (accepts `^X` notation). Default: `^\`.
     #[arg(short = 'e', global = true)]

@@ -180,7 +180,11 @@ async fn kill_stays_responsive_even_behind_a_stuck_push_backlog() {
     // Comfortably more than the pty's real buffer (a handful of KB) --
     // several 60KB frames, each near the proto's own max frame size.
     for _ in 0..8 {
-        send(&mut pusher, Message::Push(bytes::Bytes::from(vec![b'x'; 60_000]))).await;
+        send(
+            &mut pusher,
+            Message::Push(bytes::Bytes::from(vec![b'x'; 60_000])),
+        )
+        .await;
     }
 
     let mut killer = connect_with_retries(&socket_path).await;
