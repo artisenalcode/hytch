@@ -16,6 +16,7 @@ use rustix::process::{Pid, Signal};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 use rustix::termios::{Winsize, tcgetwinsize, tcsetwinsize};
 use std::io;
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::Stdio;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -51,9 +52,19 @@ impl Pty {
 
         let slave_name = ptsname(&master, Vec::new()).map_err(io::Error::from)?;
         let slave_path: std::path::PathBuf = slave_name.to_string_lossy().into_owned().into();
+        // O_NOCTTY here is load-bearing, not decorative: this daemon process
+        // is (by the time `start`/`new` re-exec into it) a session leader
+        // with no controlling terminal. Opening a tty device without
+        // O_NOCTTY under those conditions makes the kernel auto-assign it
+        // as *this process's* controlling terminal -- stealing it out from
+        // under the child we're about to spawn, whose own pre_exec below
+        // claims it deliberately via setsid()+TIOCSCTTY. Without this flag
+        // the daemon would acquire (and later lose, triggering a SIGHUP to
+        // itself) a controlling terminal it never meant to have.
         let slave = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(rustix::fs::OFlags::NOCTTY.bits() as i32)
             .open(&slave_path)?;
 
         let mut cmd = Command::new(program);

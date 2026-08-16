@@ -52,6 +52,13 @@ enum PtyCommand {
 /// Run the daemon until the child exits or the daemon itself is signaled.
 /// Cleans up (end-of-session log marker, socket unlink) before returning.
 pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
+    // Create the session directory (and its log's parent, same directory
+    // in practice) if this is the first session there -- mirrors atch's
+    // get_session_dir() auto-creating ~/.cache/<prog> on demand.
+    if let Some(parent) = config.socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
     let mut pty = Pty::spawn(
         &config.program,
         &config.args,

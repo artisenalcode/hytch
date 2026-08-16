@@ -51,6 +51,33 @@ async fn read_for(stream: &mut UnixStream, duration: Duration) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn run_creates_the_session_directory_if_missing() {
+    // Regression test: the existing test_config() helper puts the socket
+    // directly in the tempdir root, which always exists (TempDir creates
+    // it), so it never exercised the "first session ever, ~/.cache/hytch
+    // doesn't exist yet" path -- caught manually, not by the suite.
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("nested").join("session-dir");
+    assert!(!nested.exists());
+
+    let config = DaemonConfig {
+        socket_path: nested.join("session.sock"),
+        log_path: None,
+        log_max_size: 1024 * 1024,
+        scrollback_size: 4096,
+        program: "sleep".to_string(),
+        args: vec!["1".to_string()],
+        initial_rows: 24,
+        initial_cols: 80,
+    };
+    let socket_path = config.socket_path.clone();
+
+    let handle = tokio::spawn(run(config));
+    connect_with_retries(&socket_path).await; // succeeds only if bind() worked
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn two_attached_clients_see_byte_identical_fanout() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(&dir, "cat", &[], false);
