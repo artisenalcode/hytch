@@ -77,18 +77,49 @@ pub async fn spawn_detached(req: &SpawnRequest) -> io::Result<()> {
                 "daemon process exited immediately ({status}) -- check the program name/path"
             )))
         }
-        () = wait_for_socket(&req.socket_path, Duration::from_secs(3)) => Ok(()),
+        found = wait_for_socket(&req.socket_path, Duration::from_secs(3)) => {
+            if found {
+                Ok(())
+            } else {
+                // The daemon neither bound its socket nor exited within the
+                // deadline -- previously this branch returned Ok
+                // unconditionally, so a genuinely hung daemon (or the same
+                // false-positive-path case, before is_socket() existed)
+                // was reported as a successful start.
+                Err(io::Error::other(
+                    "daemon did not report ready within the timeout",
+                ))
+            }
+        }
     }
 }
 
-async fn wait_for_socket(path: &Path, timeout: Duration) {
+/// True only if `path` is actually a socket -- not just "something exists
+/// there". Found by hitting a real false-positive: a session name of `..`
+/// resolves (once the kernel processes the `..` component during bind())
+/// to the session *directory* itself, which already exists; bind() then
+/// fails with EADDRINUSE, but a bare `path.exists()` check is satisfied by
+/// that pre-existing directory regardless, so `start` reported success for
+/// a daemon that had already exited.
+fn is_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_socket())
+        .unwrap_or(false)
+}
+
+/// Polls for `path` becoming a real socket. Returns whether it did --
+/// callers must check this rather than assume completion means success
+/// (see the false-positive this fixes, documented on `is_socket`).
+async fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
-        if path.exists() {
-            return;
+        if is_socket(path) {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    is_socket(path) // one last check right at the deadline
 }
 
 /// The `__daemon-run` entry point itself: build a `DaemonConfig` and run it

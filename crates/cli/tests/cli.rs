@@ -358,3 +358,70 @@ fn self_attach_is_refused_instead_of_hanging() {
         .assert()
         .success();
 }
+
+#[test]
+fn long_home_path_still_works_via_the_af_unix_workaround() {
+    // AF_UNIX's sun_path is ~107 usable bytes on Linux. A tempdir root is
+    // already long enough on its own that a realistic session name pushes
+    // the full socket path over the limit -- this is exactly the class of
+    // path that failed outright before the chdir-based workaround (bind()
+    // erroring "path must be shorter than SUN_LEN").
+    let home = tempfile::Builder::new()
+        .prefix("hytch-edge-case-long-home-directory-name-to-exceed-af-unix-sun-path-limit-")
+        .tempdir()
+        .unwrap();
+    let session = "a-reasonably-descriptive-session-name";
+    assert!(
+        home.path()
+            .join(".cache/hytch")
+            .join(session)
+            .as_os_str()
+            .len()
+            > 107,
+        "test setup should actually exceed the AF_UNIX limit"
+    );
+
+    hytch(home.path())
+        .args(["start", session, "--", "cat"])
+        .assert()
+        .success();
+
+    let socket = home.path().join(".cache/hytch").join(session);
+    assert!(wait_until(|| socket.exists(), Duration::from_secs(2)));
+
+    hytch(home.path())
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[running]"));
+
+    hytch(home.path())
+        .args(["kill", session])
+        .assert()
+        .success();
+}
+
+#[test]
+fn dotdot_and_empty_session_names_are_rejected_with_a_clear_message() {
+    // Regression test: `..` (or `.`, or "") as a bare session name resolves
+    // via Path::join to the session directory itself once the kernel
+    // processes the `..` component at bind() time -- previously this
+    // silently reported "started" against an already-existing directory
+    // (see spawn.rs's is_socket() and session::is_valid_bare_name() doc
+    // comments for the full mechanism).
+    let home = tempfile::tempdir().unwrap();
+
+    for bad_name in ["..", ".", ""] {
+        hytch(home.path())
+            .args(["start", bad_name, "--", "cat"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("not a valid session name"));
+    }
+
+    hytch(home.path())
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no sessions"));
+}

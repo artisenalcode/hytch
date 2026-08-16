@@ -73,7 +73,7 @@ async fn send_control(socket_path: &Path, msg: hytch_proto::Message) -> std::io:
     use tokio::io::AsyncWriteExt;
     use tokio_util::codec::Encoder;
 
-    let mut stream = tokio::net::UnixStream::connect(socket_path).await?;
+    let mut stream = crate::sockets::connect(socket_path).await?;
     let mut codec = hytch_proto::MessageCodec::default();
     let mut buf = bytes::BytesMut::new();
     codec.encode(msg, &mut buf)?;
@@ -92,7 +92,7 @@ pub async fn push(socket_path: &Path, name: &str) -> i32 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::codec::Encoder;
 
-    let mut stream = match tokio::net::UnixStream::connect(socket_path).await {
+    let mut stream = match crate::sockets::connect(socket_path).await {
         Ok(s) => s,
         Err(e) => {
             print_connect_error(name, &e);
@@ -140,7 +140,7 @@ pub fn clear(log_path: &Path, name: &str, quiet: bool) -> i32 {
 pub fn rm(socket_path: &Path, log_path: &Path, name: &str, quiet: bool) -> i32 {
     // Refuse if a daemon is actually listening -- mirrors atch: "use kill
     // first". A quick non-blocking connect attempt is enough to tell.
-    if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+    if crate::sockets::connect_probe(socket_path).is_ok() {
         println!("hytch: session '{name}' is running (use 'hytch kill {name}' first)");
         return 1;
     }
@@ -203,7 +203,7 @@ pub fn list(session_dir: &Path, show_all: bool, quiet: bool) -> i32 {
         // wired up yet, so this deliberately says "running", not
         // "attached").
         let path = entry.path();
-        let running = std::os::unix::net::UnixStream::connect(&path).is_ok();
+        let running = crate::sockets::connect_probe(&path).is_ok();
         if running {
             println!("{name:<24} [running]");
         } else {

@@ -101,7 +101,7 @@ pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
         None => None,
     };
 
-    let listener = UnixListener::bind(&config.socket_path)?;
+    let listener = bind_listener(&config.socket_path)?;
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<PtyCommand>(256);
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -166,6 +166,29 @@ pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
     let _ = std::fs::remove_file(&config.socket_path);
 
     Ok(reason)
+}
+
+/// Binds a `UnixListener` at `path`, working around `AF_UNIX`'s ~107-byte
+/// `sun_path` limit the same way atch's `socket_with_chdir` does: `chdir`
+/// into the parent directory and bind the short relative name instead, then
+/// restore the original working directory. Found by actually hitting the
+/// failure (a moderately long `$HOME` plus a descriptive session name is
+/// well within reach of real use, not a contrived case) -- `bind()` with
+/// the full path just fails with "path must be shorter than SUN_LEN" and
+/// no workaround, which a detached daemon's null'd stderr then swallows
+/// entirely, surfacing only as a confusing "exited immediately" from the
+/// CLI side.
+fn bind_listener(path: &std::path::Path) -> std::io::Result<UnixListener> {
+    match hytch_session::shorten_for_unix_socket(path) {
+        None => UnixListener::bind(path),
+        Some((dir, short_name)) => {
+            let original_cwd = std::env::current_dir()?;
+            std::env::set_current_dir(&dir)?;
+            let result = UnixListener::bind(&short_name);
+            std::env::set_current_dir(&original_cwd)?;
+            result
+        }
+    }
 }
 
 /// Bridges async `push()` calls to a dedicated blocking OS thread that owns

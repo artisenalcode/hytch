@@ -36,7 +36,7 @@ pub async fn attach_foreground(
         return Err(e);
     }
 
-    let stream = tokio::net::UnixStream::connect(socket_path).await?;
+    let stream = crate::sockets::connect(socket_path).await?;
     let (conn_read, conn_write) = stream.into_split();
 
     let stdin_fd = rustix::stdio::stdin();

@@ -1,6 +1,7 @@
 mod attach;
 mod commands;
 mod paths;
+mod sockets;
 mod spawn;
 
 use clap::{Parser, Subcommand};
@@ -212,7 +213,21 @@ async fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(code as u8)
 }
 
-fn build_spawn_request(session: &str, cmd: Vec<String>, log_max_size: u64) -> SpawnRequest {
+fn build_spawn_request(
+    session: &str,
+    cmd: Vec<String>,
+    log_max_size: u64,
+) -> Result<SpawnRequest, String> {
+    // A name containing '/' is an explicit literal path (documented
+    // feature -- the user's own responsibility, same as atch), so only
+    // bare names go through the validity check. Without this, `..` (or
+    // `.`, or an empty name) resolves to the session *directory* rather
+    // than a fresh socket path, silently colliding with it -- see
+    // spawn.rs's is_socket() doc comment for how that actually surfaced.
+    if !session.contains('/') && !hytch_session::is_valid_bare_name(session) {
+        return Err(format!("'{session}' is not a valid session name"));
+    }
+
     let socket_path = paths::socket_path(session);
     let (program, args) = match cmd.split_first() {
         Some((program, rest)) => (program.clone(), rest.to_vec()),
@@ -222,7 +237,7 @@ fn build_spawn_request(session: &str, cmd: Vec<String>, log_max_size: u64) -> Sp
         ),
     };
     let (rows, cols) = current_terminal_size();
-    SpawnRequest {
+    Ok(SpawnRequest {
         log_path: (log_max_size > 0).then(|| paths::log_path_for(&socket_path)),
         socket_path,
         log_max_size,
@@ -231,7 +246,7 @@ fn build_spawn_request(session: &str, cmd: Vec<String>, log_max_size: u64) -> Sp
         cols,
         program,
         args,
-    }
+    })
 }
 
 fn current_terminal_size() -> (u16, u16) {
@@ -293,7 +308,13 @@ async fn cmd_new_after_replay(
     replayed: bool,
     quiet: bool,
 ) -> i32 {
-    let req = build_spawn_request(session, cmd, log_max_size);
+    let req = match build_spawn_request(session, cmd, log_max_size) {
+        Ok(req) => req,
+        Err(e) => {
+            eprintln!("hytch: {e}");
+            return 1;
+        }
+    };
     if let Err(e) = spawn::spawn_detached(&req).await {
         eprintln!("hytch: {session}: {e}");
         return 1;
@@ -306,7 +327,13 @@ async fn cmd_new_after_replay(
 }
 
 async fn cmd_start(session: &str, cmd: Vec<String>, log_max_size: u64, quiet: bool) -> i32 {
-    let req = build_spawn_request(session, cmd, log_max_size);
+    let req = match build_spawn_request(session, cmd, log_max_size) {
+        Ok(req) => req,
+        Err(e) => {
+            eprintln!("hytch: {e}");
+            return 1;
+        }
+    };
     match spawn::spawn_detached(&req).await {
         Ok(()) => {
             commands::print_started(session, quiet);

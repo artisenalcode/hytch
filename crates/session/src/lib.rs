@@ -39,6 +39,20 @@ pub fn resolve_socket_path(name: &str, session_dir: &Path) -> PathBuf {
     }
 }
 
+/// Rejects bare session names that are really directory-traversal
+/// components in disguise. `Path::join` doesn't normalize `.`/`..`, so
+/// `resolve_socket_path("..", dir)` produces a `PathBuf` that *looks* like
+/// `dir/..` but the kernel resolves at bind/connect time to `dir`'s parent
+/// -- an already-existing directory, not a fresh socket path. Found by
+/// hitting this directly: `hytch start ..` silently "succeeded" against
+/// the session directory itself. `resolve_socket_path` still accepts these
+/// (it has no opinion on validity, only resolution); callers creating a
+/// *new* session should check this first and reject with a clear message
+/// instead of a confusing downstream bind failure.
+pub fn is_valid_bare_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
+}
+
 /// Build the ancestry-chain env var value for a session being spawned inside
 /// `current` (the parent's own chain, if any). A single, non-nested session
 /// has one entry; nested sessions accumulate, outermost first.
@@ -57,6 +71,32 @@ pub fn ancestry_contains(chain: Option<&str>, target_socket_path: &str) -> bool 
         Some(c) => c.split(':').any(|segment| segment == target_socket_path),
         None => false,
     }
+}
+
+/// `AF_UNIX`'s `sun_path` is 108 bytes on Linux, including the NUL
+/// terminator, so the longest usable path is 107 bytes. A session dir
+/// under a moderately long `$HOME` plus a descriptive session name blows
+/// past this in practice — not a hypothetical (found by actually hitting
+/// it: `UnixListener::bind` fails outright with "path must be shorter than
+/// SUN_LEN").
+pub const MAX_SOCKET_PATH_LEN: usize = 107;
+
+/// If `path` is too long for a raw `AF_UNIX` bind/connect, returns
+/// `(dir_to_chdir_into, short_relative_name)` so the caller can `chdir`
+/// there and bind/connect using just the short name instead — mirrors
+/// atch's `socket_with_chdir`. Returns `None` when `path` already fits and
+/// no workaround is needed.
+///
+/// Pure path arithmetic only, no I/O — the actual `chdir`+bind/connect+
+/// restore sequence is the caller's job (this crate deliberately does no
+/// OS calls, see the module doc comment).
+pub fn shorten_for_unix_socket(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    if path.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
+        return None;
+    }
+    let parent = path.parent()?.to_path_buf();
+    let name = path.file_name()?.to_owned();
+    Some((parent, PathBuf::from(name)))
 }
 
 /// Human-readable form of an ancestry chain: basenames only, joined by
