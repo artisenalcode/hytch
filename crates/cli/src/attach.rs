@@ -110,13 +110,31 @@ fn self_attach_error(socket_path: &Path) -> Option<io::Error> {
     }
 }
 
-/// Dump `log_path`'s contents to stdout verbatim. Returns whether anything
-/// was replayed (a missing or empty log is not an error -- it just means
-/// this session has never produced output yet).
+/// Soft terminal reset written immediately before a log replay: DECSTR
+/// (resets scroll margins, origin mode, and other modes a stale replay
+/// could leave set), SGR reset (clears any color/attribute state left over
+/// from *before* this attach), exit alternate screen, and show the cursor.
+/// Never a full RIS (`ESC c`) -- that also nukes the terminal's own
+/// scrollback, which would be actively unfriendly right before dumping a
+/// tool whose entire point is showing you scrollback history.
+///
+/// Exists because the log being replayed can itself be a rotation-trimmed
+/// tail (see `session_log::rotate_log_file`): even with a boundary-safe
+/// trim, the *state* a mid-stream cut point depends on (current color, an
+/// open alternate-screen, a moved scroll region) was set by bytes that are
+/// simply gone. Starting the replay from a known-clean state means a
+/// stale/trimmed log renders as at-worst-incomplete, not corrupted.
+const PRE_REPLAY_RESET: &[u8] = b"\x1b[!p\x1b[0m\x1b[?1049l\x1b[?25h";
+
+/// Dump `log_path`'s contents to stdout, preceded by a soft terminal reset
+/// (see [`PRE_REPLAY_RESET`]). Returns whether anything was replayed (a
+/// missing or empty log is not an error -- it just means this session has
+/// never produced output yet).
 pub fn replay_log_to_stdout(log_path: &Path) -> bool {
     match std::fs::read(log_path) {
         Ok(bytes) if !bytes.is_empty() => {
             let mut stdout = io::stdout();
+            let _ = stdout.write_all(PRE_REPLAY_RESET);
             let _ = stdout.write_all(&bytes);
             let _ = stdout.flush();
             true
