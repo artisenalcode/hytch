@@ -280,6 +280,50 @@ fn attach_exits_with_the_session_ended_code_when_the_child_process_exits() {
 }
 
 #[test]
+fn default_bare_invocation_also_exits_with_the_session_ended_code() {
+    // Same scenario as the test above, but through the bare/default
+    // invocation (`hytch <session>`, no `attach` subcommand) instead --
+    // this is the path the README's SSH auto-attach snippet actually uses
+    // (`hytch main`), and it used to hardcode `return 0` on any successful
+    // attach regardless of AttachOutcome, so a real session end here was
+    // silently indistinguishable from a detach. Caught by hand, not by the
+    // test above, precisely because that test only exercises the explicit
+    // `attach` subcommand's own code path (cmd_attach_replayed) -- this one
+    // exists so the same regression can't slip back in through cmd_default.
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join(".cache/hytch/endtest2");
+
+    hytch(home.path())
+        .args(["start", "endtest2", "--", "sh", "-c", "sleep 0.3; exit 0"])
+        .assert()
+        .success();
+    assert!(wait_until(|| socket.exists(), Duration::from_secs(2)));
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("hytch"))
+        .env("HOME", home.path())
+        .env_remove("HYTCH_SESSION")
+        .args(["endtest2"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!("DEBUG timed out; socket.exists()={}", socket.exists());
+            panic!("bare attach did not exit within the timeout");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(90));
+}
+
+#[test]
 fn crashed_daemon_log_survives_and_replays_on_next_attach() {
     // Simulate a real crash (SIGKILL on the daemon process itself, not the
     // graceful `Message::Kill` control path that only signals the child)

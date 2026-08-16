@@ -423,12 +423,19 @@ async fn cmd_default(
     let replayed = attach::replay_log_to_stdout(&log_path);
 
     // Try a strict attach first; only spawn if nothing is listening.
+    // Same exit-code mapping as the explicit `attach` subcommand
+    // (cmd_attach_replayed) -- this bare/default form is what the README's
+    // SSH auto-attach snippet actually invokes (`hytch main`), so it's the
+    // path that has to carry EXIT_SESSION_ENDED for `[[ $? -eq 90 ]] &&
+    // exit` to ever fire. Previously this returned a bare 0 on any
+    // successful attach regardless of outcome, so a real session end
+    // (typing `exit`/^D at the hosted shell) was silently indistinguishable
+    // from a detach -- the wrapper never logged the SSH connection off.
     if socket_path.exists()
-        && attach::attach_foreground(&socket_path, detach_char, replayed, quiet)
-            .await
-            .is_ok()
+        && let Ok(outcome) =
+            attach::attach_foreground(&socket_path, detach_char, replayed, quiet).await
     {
-        return 0;
+        return exit_code_for_outcome(outcome);
     }
     cmd_new_after_replay(session, cmd, log_max_size, detach_char, replayed, quiet).await
 }
