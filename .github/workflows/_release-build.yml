@@ -1,0 +1,120 @@
+name: Build & publish release
+
+# Reusable workflow: the actual cross-compile + package + GitHub-release
+# steps, shared by both ways a release gets cut --
+#   - release.yml: a human pushes a `vX.Y.Z` tag by hand (the manual path
+#     documented in the README).
+#   - auto-version.yml: a commit lands on `main`, gets auto-bumped and
+#     auto-tagged, then calls straight into this workflow instead of
+#     relying on that tag push re-triggering release.yml -- pushes made
+#     with the default GITHUB_TOKEN deliberately don't fire new workflow
+#     runs (GitHub's own loop-prevention), so that re-trigger would never
+#     happen.
+#
+# Takes the tag as an explicit input rather than reading it off
+# `GITHUB_REF_NAME`: in the auto-version.yml caller, the *workflow's* ref
+# is still `main` (the push that started the run), not the tag that gets
+# created partway through the job -- so there's no ambient ref this
+# workflow could read that's guaranteed correct for both callers.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: The `vX.Y.Z` tag to build and release (must already exist).
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fails fast, before spending any build minutes, if the tag being built
+  # and Cargo.toml's [workspace.package] version have drifted apart -- the
+  # single source of truth is Cargo.toml; the tag is just how a release is
+  # triggered, and `hytch --version` at runtime is compiled from Cargo.toml,
+  # not from the tag. Without this check, `--version` could silently print
+  # something other than the tag a user actually downloaded.
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Tag must match Cargo.toml's workspace version
+        run: |
+          tag_version="${{ inputs.tag }}"
+          tag_version="${tag_version#v}"
+          cargo_version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          echo "tag: $tag_version, Cargo.toml: $cargo_version"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::Tag ${{ inputs.tag }} does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+
+  build:
+    needs: check-version
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # rustix's default linux_raw backend needs no libc at all, so the
+      # only cross-compilation dependency here is a linker that can target
+      # aarch64 -- Rust ships self-contained musl crt objects for both
+      # targets already. Verified locally that x86_64-unknown-linux-musl
+      # builds and runs with zero extra toolchain (see BENCHMARKS.md /
+      # commit history); aarch64 needs this cross-linker because the dev
+      # machine this was built on is x86_64-only.
+      - name: Install aarch64 cross-linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }} -p hytch
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/hytch dist/hytch
+          tar -C dist -czf hytch-linux-${{ matrix.arch }}.tgz hytch
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hytch-linux-${{ matrix.arch }}
+          path: hytch-linux-${{ matrix.arch }}.tgz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: dist/*.tgz
+          generate_release_notes: true
