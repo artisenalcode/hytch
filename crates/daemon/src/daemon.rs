@@ -4,6 +4,7 @@
 //! serializing everything through one thread), accepts client connections,
 //! and fans pty output out through a [`Fanout`].
 
+use crate::age::format_age;
 use crate::fanout::Fanout;
 use crate::pty::Pty;
 use crate::session_log::SessionLog;
@@ -59,6 +60,8 @@ pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
         std::fs::create_dir_all(parent)?;
     }
 
+    let started_at = std::time::Instant::now();
+
     let mut pty = Pty::spawn(
         &config.program,
         &config.args,
@@ -68,7 +71,7 @@ pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
 
     let fanout = Arc::new(Fanout::new(config.scrollback_size, 1024));
 
-    let log_tx = match &config.log_path {
+    let log = match &config.log_path {
         Some(path) => Some(spawn_log_writer(path.clone(), config.log_max_size)?),
         None => None,
     };
@@ -101,7 +104,7 @@ pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
                     Ok(n) => {
                         let chunk = Bytes::copy_from_slice(&buf[..n]);
                         fanout.push(chunk.clone());
-                        if let Some(tx) = &log_tx {
+                        if let Some((tx, _)) = &log {
                             let _ = tx.send(chunk);
                         }
                         continue;
@@ -115,8 +118,17 @@ pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
         }
     };
 
-    if let Some(tx) = log_tx {
-        drop(tx); // closes the channel so the writer thread's loop ends
+    if let Some((tx, handle)) = log {
+        let marker = format!(
+            "\r\n[hytch: session ended after {}]\r\n",
+            format_age(started_at.elapsed().as_secs())
+        );
+        let _ = tx.send(Bytes::from(marker.into_bytes()));
+        drop(tx); // closes the channel once the marker above is drained
+        // Wait for the writer thread to actually finish, not just for the
+        // channel to close -- otherwise a detached daemon process could
+        // exit before its own end-marker write lands on disk.
+        let _ = handle.await;
     }
     let _ = std::fs::remove_file(&config.socket_path);
 
@@ -128,15 +140,18 @@ pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
 /// multi-megabyte read+write — off the tokio reactor thread entirely
 /// (review finding #5: the C version ran this inline in its single-threaded
 /// event loop, stalling every attached client for the duration).
-fn spawn_log_writer(path: PathBuf, max_size: u64) -> std::io::Result<mpsc::UnboundedSender<Bytes>> {
+fn spawn_log_writer(
+    path: PathBuf,
+    max_size: u64,
+) -> std::io::Result<(mpsc::UnboundedSender<Bytes>, tokio::task::JoinHandle<()>)> {
     let mut log = SessionLog::open(&path, max_size)?;
     let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
-    tokio::task::spawn_blocking(move || {
+    let handle = tokio::task::spawn_blocking(move || {
         while let Some(chunk) = rx.blocking_recv() {
             let _ = log.append(&chunk);
         }
     });
-    Ok(tx)
+    Ok((tx, handle))
 }
 
 async fn recv_next(

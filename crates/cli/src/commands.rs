@@ -80,24 +80,43 @@ async fn send_control(socket_path: &Path, msg: hytch_proto::Message) -> std::io:
     stream.write_all(&buf).await
 }
 
-pub async fn push(socket_path: &Path, name: &str) -> i32 {
-    use tokio::io::AsyncReadExt;
+/// Stays comfortably under `hytch_proto::DEFAULT_MAX_FRAME_LEN` (64 KiB) --
+/// that cap exists so the daemon never has to trust a claimed frame length
+/// enough to allocate for it; a large `push` has to chunk into multiple
+/// frames to respect it, not treat the whole of stdin as one frame. Found
+/// by an actual 2 MiB push test that got disconnected mid-write once the
+/// daemon rejected the oversized single frame.
+const PUSH_CHUNK_SIZE: usize = 32 * 1024;
 
-    let mut stdin_buf = Vec::new();
-    if let Err(e) = tokio::io::stdin().read_to_end(&mut stdin_buf).await {
-        eprintln!("hytch: {name}: {e}");
-        return 1;
-    }
-    match send_control(
-        socket_path,
-        hytch_proto::Message::Push(bytes::Bytes::from(stdin_buf)),
-    )
-    .await
-    {
-        Ok(()) => 0,
+pub async fn push(socket_path: &Path, name: &str) -> i32 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::codec::Encoder;
+
+    let mut stream = match tokio::net::UnixStream::connect(socket_path).await {
+        Ok(s) => s,
         Err(e) => {
             print_connect_error(name, &e);
-            1
+            return 1;
+        }
+    };
+
+    let mut codec = hytch_proto::MessageCodec::default();
+    let mut stdin = tokio::io::stdin();
+    let mut chunk = vec![0u8; PUSH_CHUNK_SIZE];
+    loop {
+        let n = match stdin.read(&mut chunk).await {
+            Ok(0) => return 0,
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("hytch: {name}: {e}");
+                return 1;
+            }
+        };
+        let mut buf = bytes::BytesMut::new();
+        let msg = hytch_proto::Message::Push(bytes::Bytes::copy_from_slice(&chunk[..n]));
+        if codec.encode(msg, &mut buf).is_err() || stream.write_all(&buf).await.is_err() {
+            eprintln!("hytch: {name}: connection to session lost mid-push");
+            return 1;
         }
     }
 }
@@ -214,7 +233,7 @@ pub fn list(session_dir: &Path, show_all: bool, quiet: bool) -> i32 {
     0
 }
 
-fn print_connect_error(name: &str, e: &std::io::Error) {
+pub fn print_connect_error(name: &str, e: &std::io::Error) {
     match e.kind() {
         std::io::ErrorKind::NotFound => println!("hytch: session '{name}' does not exist"),
         std::io::ErrorKind::ConnectionRefused => {

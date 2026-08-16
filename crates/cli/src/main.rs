@@ -233,10 +233,23 @@ fn current_terminal_size() -> (u16, u16) {
 }
 
 async fn cmd_attach(session: &str, detach_char: Option<u8>, quiet: bool) -> i32 {
-    match attach::attach_foreground(&paths::socket_path(session), detach_char, quiet).await {
+    let socket_path = paths::socket_path(session);
+    let log_path = paths::log_path_for(&socket_path);
+    let replayed = attach::replay_log_to_stdout(&log_path);
+    cmd_attach_replayed(session, &socket_path, detach_char, replayed, quiet).await
+}
+
+async fn cmd_attach_replayed(
+    session: &str,
+    socket_path: &std::path::Path,
+    detach_char: Option<u8>,
+    replayed: bool,
+    quiet: bool,
+) -> i32 {
+    match attach::attach_foreground(socket_path, detach_char, replayed, quiet).await {
         Ok(_) => 0,
         Err(e) => {
-            eprintln!("hytch: session '{session}': {e}");
+            commands::print_connect_error(session, &e);
             1
         }
     }
@@ -249,6 +262,26 @@ async fn cmd_new(
     detach_char: Option<u8>,
     quiet: bool,
 ) -> i32 {
+    // A `new` invoked directly (not via the default attach-or-create
+    // fallback) hasn't replayed anything yet in this process -- do it here,
+    // same as atch: a name reused from a prior (now-gone) session still has
+    // its old log on disk, and creating a same-named session again should
+    // show it first, same "you know exactly what it did" guarantee as
+    // reattaching to one that's still running.
+    let socket_path = paths::socket_path(session);
+    let log_path = paths::log_path_for(&socket_path);
+    let replayed = attach::replay_log_to_stdout(&log_path);
+    cmd_new_after_replay(session, cmd, log_max_size, detach_char, replayed, quiet).await
+}
+
+async fn cmd_new_after_replay(
+    session: &str,
+    cmd: Vec<String>,
+    log_max_size: u64,
+    detach_char: Option<u8>,
+    replayed: bool,
+    quiet: bool,
+) -> i32 {
     let req = build_spawn_request(session, cmd, log_max_size);
     if let Err(e) = spawn::spawn_detached(&req).await {
         eprintln!("hytch: {session}: {e}");
@@ -257,7 +290,8 @@ async fn cmd_new(
     if !quiet {
         eprintln!("hytch: session '{session}' created");
     }
-    cmd_attach(session, detach_char, quiet).await
+    let socket_path = paths::socket_path(session);
+    cmd_attach_replayed(session, &socket_path, detach_char, replayed, quiet).await
 }
 
 async fn cmd_start(session: &str, cmd: Vec<String>, log_max_size: u64, quiet: bool) -> i32 {
@@ -286,15 +320,22 @@ async fn cmd_default(
     };
     let cmd = cmd.to_vec();
 
+    // Replay exactly once for this whole invocation, regardless of which
+    // branch below actually ends up attaching -- see attach_foreground's
+    // doc comment for why doing it per-branch would show history twice.
+    let socket_path = paths::socket_path(session);
+    let log_path = paths::log_path_for(&socket_path);
+    let replayed = attach::replay_log_to_stdout(&log_path);
+
     // Try a strict attach first; only spawn if nothing is listening.
-    if paths::socket_path(session).exists()
-        && attach::attach_foreground(&paths::socket_path(session), detach_char, quiet)
+    if socket_path.exists()
+        && attach::attach_foreground(&socket_path, detach_char, replayed, quiet)
             .await
             .is_ok()
     {
         return 0;
     }
-    cmd_new(session, cmd, log_max_size, detach_char, quiet).await
+    cmd_new_after_replay(session, cmd, log_max_size, detach_char, replayed, quiet).await
 }
 
 fn cmd_clear(session: Option<String>, quiet: bool) -> i32 {

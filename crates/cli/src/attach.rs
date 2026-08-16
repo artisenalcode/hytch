@@ -2,17 +2,34 @@
 //! testability) to the real terminal: real stdin/stdout, real raw-mode
 //! termios on the real controlling tty, a real `SIGWINCH` watcher, and a
 //! real `UnixStream` to the daemon.
+//!
+//! Also owns cold log replay: the on-disk log is the primary source of
+//! "what happened," always shown first when present, whether the session
+//! is still running, exited cleanly, or crashed. This is the actual
+//! feature behind "resume exactly where you left off... whether the
+//! session is still running, crashed, or you rebooted the machine" from
+//! the original design brief -- without it, a crashed daemon (socket file
+//! left behind, `ECONNREFUSED` on connect) would just report an error and
+//! show nothing, even though the full history is sitting right there on
+//! disk.
 
 use hytch_client::{AttachOptions, AttachOutcome};
-use std::io;
+use std::io::{self, Write as _};
 use std::path::Path;
 
-/// Attach to a running session over `socket_path`. Fails immediately if the
-/// daemon isn't listening -- callers that want create-if-missing behavior
-/// handle that themselves before calling this.
+/// Attach to a running session over `socket_path`. `replayed` records
+/// whether the caller already dumped the on-disk log to stdout (via
+/// [`replay_log_to_stdout`]) before calling this -- callers are responsible
+/// for doing that replay exactly once, since a caller like the default
+/// attach-or-create flow may try a connect, fall back to spawning a fresh
+/// session, and attach again, and the log must not be shown twice across
+/// that whole sequence (mirrors atch's `log_already_replayed` guard).
+/// When `replayed` is true, the daemon's own in-memory ring-buffer replay
+/// is skipped too, for the same reason.
 pub async fn attach_foreground(
     socket_path: &Path,
     detach_char: Option<u8>,
+    replayed: bool,
     quiet: bool,
 ) -> io::Result<AttachOutcome> {
     let stream = tokio::net::UnixStream::connect(socket_path).await?;
@@ -42,7 +59,7 @@ pub async fn attach_foreground(
         (24, 80)
     };
 
-    if !quiet {
+    if !quiet && !replayed {
         eprintln!();
     }
 
@@ -52,7 +69,9 @@ pub async fn attach_foreground(
         redraw_method: hytch_proto::RedrawMethod::Winch,
         rows,
         cols,
-        skip_ring: false,
+        // The on-disk log already showed the tail; skip the daemon's
+        // in-memory ring-buffer replay so history isn't shown twice.
+        skip_ring: replayed,
     };
 
     hytch_client::run(
@@ -64,4 +83,19 @@ pub async fn attach_foreground(
         opts,
     )
     .await
+}
+
+/// Dump `log_path`'s contents to stdout verbatim. Returns whether anything
+/// was replayed (a missing or empty log is not an error -- it just means
+/// this session has never produced output yet).
+pub fn replay_log_to_stdout(log_path: &Path) -> bool {
+    match std::fs::read(log_path) {
+        Ok(bytes) if !bytes.is_empty() => {
+            let mut stdout = io::stdout();
+            let _ = stdout.write_all(&bytes);
+            let _ = stdout.flush();
+            true
+        }
+        _ => false,
+    }
 }

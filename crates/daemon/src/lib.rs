@@ -1,6 +1,7 @@
 //! The `hytch` session daemon: pty management, scrollback ring buffer,
 //! on-disk session log, and client fanout.
 
+mod age;
 pub mod daemon;
 pub mod fanout;
 pub mod pty;

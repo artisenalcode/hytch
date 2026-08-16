@@ -230,3 +230,101 @@ fn attach_to_a_nonexistent_session_fails() {
         .assert()
         .failure();
 }
+
+#[test]
+fn crashed_daemon_log_survives_and_replays_on_next_attach() {
+    // Simulate a real crash (SIGKILL on the daemon process itself, not the
+    // graceful `Message::Kill` control path that only signals the child)
+    // and verify the on-disk log -- not just the ring buffer, which dies
+    // with the process -- is what makes "resume after a crash" work.
+    let home = tempfile::tempdir().unwrap();
+    let session_dir = home.path().join(".cache/hytch");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let socket = session_dir.join("crashtest");
+    let log = session_dir.join("crashtest.log");
+
+    // Spawn __daemon-run directly (bypassing `start`'s own detach dance)
+    // so the test holds a real Child handle to SIGKILL.
+    let mut daemon = std::process::Command::new(assert_cmd::cargo::cargo_bin("hytch"))
+        .args([
+            "__daemon-run",
+            socket.to_str().unwrap(),
+            log.to_str().unwrap(),
+            "1048576",
+            "131072",
+            "24",
+            "80",
+            "cat",
+        ])
+        .env("HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    assert!(wait_until(|| socket.exists(), Duration::from_secs(2)));
+
+    hytch(home.path())
+        .args(["push", "crashtest"])
+        .write_stdin("survivor-bytes\n")
+        .assert()
+        .success();
+    assert!(wait_until(
+        || std::fs::read(&log)
+            .map(|c| c.windows(14).any(|w| w == b"survivor-bytes"))
+            .unwrap_or(false),
+        Duration::from_secs(2),
+    ));
+
+    // The actual crash.
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+
+    // A crashed daemon leaves its socket behind (no graceful cleanup ran)
+    // -- connecting to it must fail, proving this is really testing the
+    // cold path and not accidentally still talking to a live daemon.
+    assert!(std::os::unix::net::UnixStream::connect(&socket).is_err());
+
+    // `attach` against the now-dead socket should still show the log.
+    hytch(home.path())
+        .args(["attach", "crashtest"])
+        .assert()
+        .failure() // nothing is actually listening -- this is expected
+        .stdout(predicate::str::contains("survivor-bytes"));
+}
+
+#[test]
+fn large_push_completes_quickly() {
+    // Regression test for review finding #4: the C protocol's winsize-union
+    // alias capped every push chunk at 8 bytes, so a payload this size would
+    // have needed hundreds of thousands of syscalls. The new length-prefixed
+    // proto frames it as (close to) one shot; this should complete in well
+    // under a second, not visibly stall.
+    let home = tempfile::tempdir().unwrap();
+    hytch(home.path())
+        .args(["start", "bigpush", "--", "cat"])
+        .assert()
+        .success();
+    let socket = home.path().join(".cache/hytch/bigpush");
+    assert!(wait_until(|| socket.exists(), Duration::from_secs(2)));
+
+    let payload = "x".repeat(2 * 1024 * 1024); // 2 MiB
+    let started = std::time::Instant::now();
+    hytch(home.path())
+        .args(["push", "bigpush"])
+        .write_stdin(payload)
+        .timeout(Duration::from_secs(5))
+        .assert()
+        .success();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a 2MiB push took {elapsed:?} -- should be near-instant with no 8-byte cap"
+    );
+
+    hytch(home.path())
+        .args(["kill", "bigpush"])
+        .assert()
+        .success();
+}
