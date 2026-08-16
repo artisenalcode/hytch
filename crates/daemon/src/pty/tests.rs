@@ -7,7 +7,14 @@ use tokio::time::timeout;
 
 #[tokio::test]
 async fn spawns_and_captures_child_stdout() {
-    let mut pty = Pty::spawn("printf", &["hello".to_string()], 24, 80).expect("spawn");
+    let mut pty = Pty::spawn(
+        "printf",
+        &["hello".to_string()],
+        24,
+        80,
+        "/tmp/test-session",
+    )
+    .expect("spawn");
 
     let mut buf = [0u8; 64];
     let n = timeout(Duration::from_secs(2), pty.read(&mut buf))
@@ -19,8 +26,38 @@ async fn spawns_and_captures_child_stdout() {
 }
 
 #[tokio::test]
+async fn child_sees_the_session_chain_as_hytch_session() {
+    // This is the actual mechanism a shell auto-attach hook's own recursion
+    // guard (and the CLI's self-attach guard) depends on -- verify the
+    // child process really does see it, not just that spawn() compiles
+    // with the extra argument.
+    let mut pty = Pty::spawn(
+        "sh",
+        &[
+            "-c".to_string(),
+            "printf '%s' \"$HYTCH_SESSION\"".to_string(),
+        ],
+        24,
+        80,
+        "/home/user/.cache/hytch/outer:/home/user/.cache/hytch/inner",
+    )
+    .expect("spawn");
+
+    let mut buf = [0u8; 128];
+    let n = timeout(Duration::from_secs(2), pty.read(&mut buf))
+        .await
+        .expect("read did not time out")
+        .expect("read succeeded");
+
+    assert_eq!(
+        &buf[..n],
+        b"/home/user/.cache/hytch/outer:/home/user/.cache/hytch/inner"
+    );
+}
+
+#[tokio::test]
 async fn resize_is_visible_via_current_size() {
-    let pty = Pty::spawn("sleep", &["5".to_string()], 24, 80).expect("spawn");
+    let pty = Pty::spawn("sleep", &["5".to_string()], 24, 80, "/tmp/test-session").expect("spawn");
     assert_eq!(pty.current_size().unwrap(), (24, 80));
 
     pty.resize(50, 120).unwrap();
@@ -31,7 +68,8 @@ async fn resize_is_visible_via_current_size() {
 
 #[tokio::test]
 async fn signal_terminates_the_child_and_wait_reports_it() {
-    let mut pty = Pty::spawn("sleep", &["30".to_string()], 24, 80).expect("spawn");
+    let mut pty =
+        Pty::spawn("sleep", &["30".to_string()], 24, 80, "/tmp/test-session").expect("spawn");
 
     pty.signal(Signal::Kill).unwrap();
 
@@ -51,7 +89,7 @@ async fn write_reaches_child_stdin_through_the_pty() {
     // of what we typed into the read stream, so we only assert that cat's
     // echoed line shows up somewhere in the captured output, not an exact
     // byte match against the whole stream.
-    let mut pty = Pty::spawn("cat", &[], 24, 80).expect("spawn");
+    let mut pty = Pty::spawn("cat", &[], 24, 80, "/tmp/test-session").expect("spawn");
 
     pty.write_all(b"ping\n").await.unwrap();
 

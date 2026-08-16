@@ -36,7 +36,20 @@ pub struct Pty {
 impl Pty {
     /// Allocate a pty, spawn `program` with `args` attached to its slave
     /// side as controlling terminal, and set the initial window size.
-    pub fn spawn(program: &str, args: &[String], rows: u16, cols: u16) -> io::Result<Self> {
+    ///
+    /// `session_chain` is the value to set `HYTCH_SESSION` to inside the
+    /// child — the colon-separated ancestry chain from
+    /// `hytch_session::extend_ancestry`. This is what makes the self-attach
+    /// guard (and a shell auto-attach hook's own recursion guard) work at
+    /// all: without it, a shell running inside a session has no way to know
+    /// it's inside one.
+    pub fn spawn(
+        program: &str,
+        args: &[String],
+        rows: u16,
+        cols: u16,
+        session_chain: &str,
+    ) -> io::Result<Self> {
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).map_err(io::Error::from)?;
         grantpt(&master).map_err(io::Error::from)?;
         unlockpt(&master).map_err(io::Error::from)?;
@@ -69,6 +82,7 @@ impl Pty {
 
         let mut cmd = Command::new(program);
         cmd.args(args);
+        cmd.env(hytch_session::SESSION_ENVVAR, session_chain);
         cmd.stdin(dup_stdio(&slave)?);
         cmd.stdout(dup_stdio(&slave)?);
         cmd.stderr(dup_stdio(&slave)?);

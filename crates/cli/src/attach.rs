@@ -32,6 +32,10 @@ pub async fn attach_foreground(
     replayed: bool,
     quiet: bool,
 ) -> io::Result<AttachOutcome> {
+    if let Some(e) = self_attach_error(socket_path) {
+        return Err(e);
+    }
+
     let stream = tokio::net::UnixStream::connect(socket_path).await?;
     let (conn_read, conn_write) = stream.into_split();
 
@@ -83,6 +87,27 @@ pub async fn attach_foreground(
         opts,
     )
     .await
+}
+
+/// Refuses to attach if `socket_path` appears anywhere in this process's
+/// own `HYTCH_SESSION` ancestry chain -- catches both direct self-attach
+/// (typing the current session's own name) and indirect loops (A attaches
+/// through B back to A). Without this, a shell auto-attach hook with its
+/// own naive recursion guard would still be exposed to the indirect case,
+/// and a direct `hytch main` typed by hand while already inside `main`
+/// would just hang against the daemon's own accept loop indefinitely
+/// rather than failing cleanly.
+fn self_attach_error(socket_path: &Path) -> Option<io::Error> {
+    let chain = std::env::var(hytch_session::SESSION_ENVVAR).ok();
+    let target = socket_path.to_string_lossy();
+    if hytch_session::ancestry_contains(chain.as_deref(), &target) {
+        Some(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot attach to session from within itself",
+        ))
+    } else {
+        None
+    }
 }
 
 /// Dump `log_path`'s contents to stdout verbatim. Returns whether anything

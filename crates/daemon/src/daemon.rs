@@ -74,11 +74,24 @@ pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
 
     let started_at = std::time::Instant::now();
 
+    // Extend whatever ancestry chain this daemon process itself inherited
+    // (set if the CLI invocation that spawned us was already running
+    // inside another session -- nested sessions) with this session's own
+    // socket path, so the spawned child sees the full chain via
+    // HYTCH_SESSION. This is what the self-attach guard and a shell
+    // auto-attach hook's recursion guard both depend on.
+    let inherited_chain = std::env::var(hytch_session::SESSION_ENVVAR).ok();
+    let session_chain = hytch_session::extend_ancestry(
+        inherited_chain.as_deref(),
+        &config.socket_path.to_string_lossy(),
+    );
+
     let mut pty = Pty::spawn(
         &config.program,
         &config.args,
         config.initial_rows,
         config.initial_cols,
+        &session_chain,
     )?;
 
     let fanout = Arc::new(Fanout::new(config.scrollback_size, 1024));

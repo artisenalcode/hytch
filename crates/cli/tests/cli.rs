@@ -328,3 +328,33 @@ fn large_push_completes_quickly() {
         .assert()
         .success();
 }
+
+#[test]
+fn self_attach_is_refused_instead_of_hanging() {
+    // Without this guard, `attach` from a shell that's already inside the
+    // session it's attaching to would just block forever against the
+    // daemon's own accept loop -- a real risk once a shell auto-attach
+    // hook is in the picture (its own recursion guard depends on
+    // HYTCH_SESSION being set correctly, but a user can still type the
+    // session's own name by hand).
+    let home = tempfile::tempdir().unwrap();
+    hytch(home.path())
+        .args(["start", "selftest", "--", "cat"])
+        .assert()
+        .success();
+    let socket = home.path().join(".cache/hytch/selftest");
+    assert!(wait_until(|| socket.exists(), Duration::from_secs(2)));
+
+    hytch(home.path())
+        .args(["attach", "selftest"])
+        .env("HYTCH_SESSION", socket.to_str().unwrap())
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("itself"));
+
+    hytch(home.path())
+        .args(["kill", "selftest"])
+        .assert()
+        .success();
+}
