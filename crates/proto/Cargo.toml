@@ -1,0 +1,15 @@
+[package]
+name = "hytch-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "hytch_proto"
+
+[dependencies]
+bytes.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

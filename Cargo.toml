@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/proto",
+    "crates/session",
+    "crates/daemon",
+    "crates/client",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+# repository = "" # TODO: fill in once the GitHub repo exists
+
+[workspace.dependencies]
+bytes = "1"
+proptest = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+clap = { version = "4", features = ["derive"] }
+rustix = { version = "0.38", features = ["pty", "termios", "process", "fs", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+# panic stays "unwind" (the default): tokio isolates a panicking task's
+# unwind at the task boundary so one misbehaving client connection doesn't
+# take the whole daemon down. "abort" would defeat that.

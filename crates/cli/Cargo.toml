@@ -1,0 +1,17 @@
+[package]
+name = "hytch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Fast, lean, mouse-transparent terminal session persistence."
+publish = false
+
+[[bin]]
+name = "hytch"
+path = "src/main.rs"
+
+[dependencies]
+hytch-proto = { path = "../proto" }
+hytch-session = { path = "../session" }
+hytch-daemon = { path = "../daemon" }
+hytch-client = { path = "../client" }
