@@ -52,6 +52,18 @@ enum PtyCommand {
 
 /// Run the daemon until the child exits or the daemon itself is signaled.
 /// Cleans up (end-of-session log marker, socket unlink) before returning.
+///
+/// Structured (`tracing`) logs throughout, gated by `RUST_LOG` the normal
+/// way (`RUST_LOG=hytch=debug hytch start ...`) -- a genuine operational
+/// upgrade over atch's ad hoc `printf` status lines, not just parity: the
+/// daemon runs detached with no terminal to print to in the first place, so
+/// atch's approach of writing status text to a controlling terminal that
+/// may not exist doesn't translate; a real log level, structured fields,
+/// and `RUST_LOG` filtering do.
+#[tracing::instrument(
+    skip(config),
+    fields(socket = %config.socket_path.display(), program = %config.program)
+)]
 pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
     // Create the session directory (and its log's parent, same directory
     // in practice) if this is the first session there -- mirrors atch's
@@ -82,11 +94,19 @@ pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
+    tracing::info!(
+        rows = config.initial_rows,
+        cols = config.initial_cols,
+        logging = config.log_path.is_some(),
+        "daemon started"
+    );
+
     let mut buf = [0u8; 4096];
     let reason = loop {
         tokio::select! {
             accepted = listener.accept() => {
                 if let Ok((stream, _)) = accepted {
+                    tracing::debug!("client connected");
                     tokio::spawn(handle_client(stream, fanout.clone(), cmd_tx.clone()));
                 }
             }
@@ -118,11 +138,11 @@ pub async fn run(config: DaemonConfig) -> std::io::Result<ShutdownReason> {
         }
     };
 
+    let age = format_age(started_at.elapsed().as_secs());
+    tracing::info!(reason = ?reason, age = %age, "daemon shutting down");
+
     if let Some((tx, handle)) = log {
-        let marker = format!(
-            "\r\n[hytch: session ended after {}]\r\n",
-            format_age(started_at.elapsed().as_secs())
-        );
+        let marker = format!("\r\n[hytch: session ended after {age}]\r\n");
         let _ = tx.send(Bytes::from(marker.into_bytes()));
         drop(tx); // closes the channel once the marker above is drained
         // Wait for the writer thread to actually finish, not just for the
@@ -177,13 +197,17 @@ async fn handle_client(
             msg = framed.next() => {
                 match msg {
                     Some(Ok(Message::Attach { skip_ring })) => {
+                        tracing::info!(skip_ring, "client attached");
                         let (snapshot, rx) = fanout.attach();
                         if !skip_ring && write_half.write_all(&snapshot).await.is_err() {
                             return;
                         }
                         attached = Some(rx);
                     }
-                    Some(Ok(Message::Detach)) => attached = None,
+                    Some(Ok(Message::Detach)) => {
+                        tracing::info!("client detached");
+                        attached = None;
+                    }
                     Some(Ok(Message::Push(data))) => {
                         if cmd_tx.send(PtyCommand::Push(data)).await.is_err() {
                             return;
@@ -206,12 +230,17 @@ async fn handle_client(
                         // programs) already happens above.
                     }
                     Some(Ok(Message::Kill { signal })) => {
+                        tracing::info!(signal, "kill requested");
                         let sig = Signal::from_raw(signal as i32).unwrap_or(Signal::Term);
                         if cmd_tx.send(PtyCommand::Signal(sig)).await.is_err() {
                             return;
                         }
                     }
-                    Some(Err(_)) | None => return,
+                    Some(Err(e)) => {
+                        tracing::debug!(error = %e, "client protocol error, disconnecting");
+                        return;
+                    }
+                    None => return,
                 }
             }
             item = recv_next(&mut attached) => {
