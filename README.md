@@ -52,20 +52,6 @@ HYTCH_VERSION=v0.1.0 HYTCH_INSTALL_DIR=/usr/local/bin \
   curl -fsSL https://raw.githubusercontent.com/artisenalcode/hytch/main/install.sh | bash
 ```
 
-> **While this repo is private**, GitHub serves release assets to
-> authenticated requests only — a bare `curl` against a release URL gets a
-> 404, script included. Two working options until/unless the repo goes
-> public:
->
-> ```sh
-> # Using the GitHub CLI (already authenticated as the repo owner):
-> gh release download --repo artisenalcode/hytch --pattern 'hytch-linux-amd64.tgz'
-> tar -xzf hytch-linux-amd64.tgz hytch
-> install -m 755 hytch ~/.local/bin/hytch
->
-> # Or build from source (Option 3 below) -- no GitHub auth needed at all.
-> ```
-
 ### Option 2: manual release download
 
 ```sh

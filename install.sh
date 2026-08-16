@@ -7,11 +7,6 @@
 # Env vars:
 #   HYTCH_VERSION      release tag to install, e.g. "v0.1.0" (default: latest)
 #   HYTCH_INSTALL_DIR  install directory (default: $HOME/.local/bin)
-#
-# Note: while the hytch repo is private, GitHub release assets require
-# authentication to fetch -- plain curl will get a 404. Either run this via
-# `gh release download` instead (see README.md's install section for the
-# exact command), or make the repo public first.
 
 set -euo pipefail
 
@@ -46,8 +41,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 echo "hytch: downloading ${url}"
 if ! curl -fsSL -o "${tmpdir}/hytch.tgz" "$url"; then
-  echo "hytch: download failed." >&2
-  echo "hytch: if the repo is private, use 'gh release download' instead -- see README.md." >&2
+  echo "hytch: download failed -- check the URL above, or try 'gh release download --repo ${repo}'." >&2
   exit 1
 fi
 
