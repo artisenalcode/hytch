@@ -136,6 +136,16 @@ where
                     return Ok(AttachOutcome::SessionEnded);
                 }
                 output.write_all(&out_buf[..n]).await?;
+                // `tokio::io::stdout()` (the real `Out` at the call site)
+                // hands writes to a channel + background thread rather than
+                // doing a direct syscall the way atch's `write(1, ...)` or
+                // tmux's `fflush(stdout)` do -- `write_all` completing here
+                // only means "handed off," not "on screen." Without this,
+                // echoed output can sit in that internal buffer instead of
+                // reaching the terminal promptly, which reads as laggy/
+                // batched keystroke echo even though the input side (a
+                // plain `UnixStream` half) is already unbuffered.
+                output.flush().await?;
             }
             resized = recv_resize(&mut resize_events) => {
                 if let Some((rows, cols)) = resized {
