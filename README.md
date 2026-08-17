@@ -42,13 +42,19 @@ was found, fixed, and locked in with a regression test. See
 curl -fsSL https://raw.githubusercontent.com/artisenalcode/hytch/main/install.sh | bash
 ```
 
-Downloads the latest release for your architecture, installs to
-`~/.local/bin/hytch`, and tells you if that directory isn't already on your
-`PATH`. Re-running it upgrades in place. Override the version or install
-location with env vars:
+Downloads the latest release for your architecture and installs to
+`/usr/local/bin/hytch` — one canonical location already on `PATH` for every
+shell, interactive or not (a user-writable default like `~/.local/bin`
+resolves differently for, say, an `ssh host "hytch ..."` remote command,
+which runs non-interactively and never sources the rc file that puts
+`~/.local/bin` on `PATH` — the two-location split is a real footgun, not a
+hypothetical one). Not writable by your user, as is typical for
+`/usr/local/bin`? The script retries the copy with `sudo`, prompting for
+your password once. Re-running it upgrades in place. Override the version
+or install location with env vars:
 
 ```sh
-HYTCH_VERSION=v0.1.0 HYTCH_INSTALL_DIR=/usr/local/bin \
+HYTCH_VERSION=v0.1.0 HYTCH_INSTALL_DIR="$HOME/.local/bin" \
   curl -fsSL https://raw.githubusercontent.com/artisenalcode/hytch/main/install.sh | bash
 ```
 
@@ -59,7 +65,7 @@ arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 curl -fsSL -o hytch.tgz \
   "https://github.com/artisenalcode/hytch/releases/latest/download/hytch-linux-${arch}.tgz"
 tar -xzf hytch.tgz hytch
-install -m 755 hytch ~/.local/bin/hytch   # or /usr/local/bin, with sudo
+sudo install -m 755 hytch /usr/local/bin/hytch   # or ~/.local/bin, no sudo needed
 ```
 
 Pin a specific version by replacing `latest/download` with
@@ -71,7 +77,7 @@ Pin a specific version by replacing `latest/download` with
 git clone https://github.com/artisenalcode/hytch
 cd hytch
 cargo build --release
-install -m 755 target/release/hytch ~/.local/bin/hytch
+sudo install -m 755 target/release/hytch /usr/local/bin/hytch
 ```
 
 Requires a Rust toolchain (`rustup.rs`); no other build dependencies —
@@ -97,7 +103,7 @@ sessions to restart on upgrade.
 
 ```sh
 hytch list                       # make sure nothing's running first
-rm ~/.local/bin/hytch            # or wherever you installed it
+sudo rm /usr/local/bin/hytch     # or wherever you installed it
 rm -rf ~/.cache/hytch            # session sockets + logs, if you want them gone too
 ```
 
