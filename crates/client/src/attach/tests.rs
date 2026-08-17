@@ -71,6 +71,128 @@ async fn keystrokes_forwarded_and_daemon_output_written_verbatim() {
     assert_eq!(captured, b"echo-back");
 }
 
+/// A tiny `AsyncWrite` that records how many bytes each `poll_write` call
+/// received and separately counts `poll_flush` calls, so a test can assert
+/// on the *shape* of the calls the attach loop makes -- not just the bytes
+/// that eventually land. `tokio::io::duplex`'s buffer (used by the other
+/// tests here) can't distinguish "written" from "flushed": both a real
+/// `tokio::io::Stdout` (channel + background thread, see the real call
+/// site in `cli::attach::attach_foreground`) and this mock only guarantee
+/// visibility on an explicit flush, but a duplex pipe has no such
+/// distinction to lose in the first place.
+#[derive(Default, Clone)]
+struct FlushCountingWriter {
+    state: std::sync::Arc<std::sync::Mutex<FlushCountingWriterState>>,
+}
+
+#[derive(Default)]
+struct FlushCountingWriterState {
+    bytes: Vec<u8>,
+    flush_count_after_each_write: Vec<usize>,
+    flush_calls: usize,
+}
+
+impl tokio::io::AsyncWrite for FlushCountingWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let mut state = self.state.lock().unwrap();
+        state.bytes.extend_from_slice(buf);
+        let flush_count = state.flush_calls;
+        state.flush_count_after_each_write.push(flush_count);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.state.lock().unwrap().flush_calls += 1;
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn every_daemon_output_write_is_followed_by_a_flush() {
+    // Regression test for a real, live-diagnosed bug: `tokio::io::stdout()`
+    // hands writes to a channel + background thread rather than doing a
+    // direct syscall, so `write_all().await` completing only means "handed
+    // off," not "on screen" -- without an explicit flush after every
+    // daemon-output write, echoed keystrokes (and completion output) can
+    // sit invisible in that internal buffer instead of reaching the real
+    // terminal promptly. Confirmed live: with the flush missing, real
+    // character-by-character typing under a pty never echoed at all within
+    // a multi-second window; with it restored, every keystroke echoed
+    // within single-digit milliseconds.
+    let (_input_writer, input_reader) = tokio::io::duplex(64);
+    let output = FlushCountingWriter::default();
+    let output_for_assert = output.clone();
+    let (conn_client, conn_daemon) = tokio::io::duplex(4096);
+    let (client_read, client_write) = split(conn_client);
+
+    let daemon = tokio::spawn(async move {
+        let (daemon_read, mut daemon_write) = split(conn_daemon);
+        let mut framed = FramedRead::new(daemon_read, MessageCodec::default());
+        assert!(matches!(
+            framed.next().await.unwrap().unwrap(),
+            Message::Attach { .. }
+        ));
+        assert!(matches!(
+            framed.next().await.unwrap().unwrap(),
+            Message::Redraw { .. }
+        ));
+        // Two separate daemon->client writes, each with no trailing
+        // newline -- exactly the shape of a single echoed keystroke or an
+        // in-place completion redraw, the pattern the live bug hit. A
+        // short sleep between them (rather than back-to-back writes)
+        // ensures `run`'s `conn_read.read()` completes on the first byte
+        // before the second one is even written, so this reliably produces
+        // two separate `output.write_all()` calls instead of the duplex
+        // pipe coalescing both bytes into a single read.
+        daemon_write.write_all(b"c").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        daemon_write.write_all(b"d").await.unwrap();
+        // Held open a bit longer before dropping (which closes the
+        // connection and ends `run`'s loop with `SessionEnded`) so the
+        // second write has time to actually reach `run`'s conn_read side.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    });
+
+    let outcome = run(
+        input_reader,
+        output,
+        client_read,
+        client_write,
+        None,
+        opts(Some(0x1c), None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, AttachOutcome::SessionEnded);
+    daemon.await.unwrap();
+
+    let state = output_for_assert.state.lock().unwrap();
+    assert_eq!(&state.bytes, b"cd");
+    // Every recorded write must have already seen at least one more flush
+    // than the write before it -- i.e. a flush happened between this write
+    // and the previous one, not just once at the very end.
+    assert_eq!(
+        state.flush_count_after_each_write,
+        vec![0, 1],
+        "expected a flush() between the first and second daemon-output write"
+    );
+    assert!(state.flush_calls >= 2);
+}
+
 #[tokio::test]
 async fn local_stdin_eof_reports_input_closed_not_session_ended() {
     // The distinction this test locks in: local stdin running dry (a
